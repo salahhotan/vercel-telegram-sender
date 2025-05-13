@@ -1,0 +1,25 @@
+{
+  "name": "vercel-telegram-sender",
+  "version": "1.0.0",
+  "description": "Vercel serverless function to send messages to a Telegram channel.",
+  "main": "api/send-message.js",
+  "type": "module",
+  "scripts": {
+    "start": "vercel dev",
+    "deploy": "vercel --prod",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "vercel",
+    "serverless",
+    "telegram",
+    "bot",
+    "nodejs"
+  ],
+  "author": "Your Name <youremail@example.com>",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.x"
+  }
+
+}
