@@ -10,7 +10,7 @@ export default async function handler(req, res) {
     // 2. Get environment variables
     const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL;
+    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
     if (!ALPHA_VANTAGE_API_KEY || !BOT_TOKEN || !CHANNEL_ID) {
         console.error("Missing required environment variables.");
