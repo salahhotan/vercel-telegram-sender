@@ -42,20 +42,20 @@ export default async function handler(req, res) {
         const price = alphaData['Global Quote']['05. price'];
         const changePercent = alphaData['Global Quote']['10. change percent'];
         
-        // 5. Format the message for Telegram
-        const message = `📈 *${symbol} Stock Update*:
-💵 Price: $${price}
-📊 Change: ${changePercent}
+        // 5. Format the message as plain text (no Markdown)
+        const message = `${symbol} Stock Update:
+Price: $${price}
+Change: ${changePercent}
 
-_Data provided by Alpha Vantage_`;
+Data provided by Alpha Vantage`;
 
-        // 6. Send to Telegram
+        // 6. Send to Telegram without parse_mode
         const telegramApiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
         
         const payload = {
             chat_id: CHANNEL_ID,
-            text: message,
-            parse_mode: 'MarkdownV2'
+            text: message
+            // No parse_mode specified
         };
 
         const telegramResponse = await fetch(telegramApiUrl, {
