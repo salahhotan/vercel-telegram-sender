@@ -1,8 +1,4 @@
-// api/send-message.js
-
-// We'll use the built-in fetch for Node.js 18+
-// If you are on an older Node version, you might need to install 'node-fetch'
-// and import it: const fetch = require('node-fetch');
+// api/send-price.js
 
 export default async function handler(req, res) {
     // 1. Check if it's a POST request
@@ -11,59 +7,87 @@ export default async function handler(req, res) {
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
-    // 2. Get Telegram Bot Token and Channel ID from Environment Variables
+    // 2. Get API keys from Environment Variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // e.g., "@yourchannelname" or "-1001234567890"
+    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+    const ALPHA_VANTAGE_KEY = 'MTQ00L6WCER4WWBX'; // Ideally move this to env var too
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
-        console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID environment variables.");
+        console.error("Missing Telegram environment variables.");
         return res.status(500).json({ error: 'Server configuration error.' });
     }
 
     try {
-        // 3. Get the message from the request body
-        const { message, parse_mode } = req.body; // Expecting { "message": "Your text here", "parse_mode": "MarkdownV2" (optional) }
-
-        if (!message) {
-            return res.status(400).json({ error: 'Missing "message" in request body' });
+        // 3. Get the stock symbol from request body
+        const { symbol } = req.body;
+        
+        if (!symbol) {
+            return res.status(400).json({ error: 'Missing "symbol" in request body' });
         }
 
-        // 4. Construct the Telegram API URL
-        const telegramApiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+        // 4. Fetch stock data from Alpha Vantage
+        const alphaUrl = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${ALPHA_VANTAGE_KEY}`;
+        
+        const alphaResponse = await fetch(alphaUrl);
+        const alphaData = await alphaResponse.json();
 
-        // 5. Prepare the payload for Telegram
+        if (!alphaData['Global Quote'] || !alphaData['Global Quote']['05. price']) {
+            console.error('Alpha Vantage Error:', alphaData);
+            return res.status(500).json({ 
+                error: 'Failed to fetch stock data',
+                alpha_error: alphaData.Note || alphaData.Information || 'Invalid response'
+            });
+        }
+
+        const price = alphaData['Global Quote']['05. price'];
+        const changePercent = alphaData['Global Quote']['10. change percent'];
+        
+        // 5. Format the message for Telegram
+        const message = `📈 *${symbol} Stock Update*:
+💵 Price: $${price}
+📊 Change: ${changePercent}
+
+_Data provided by Alpha Vantage_`;
+
+        // 6. Send to Telegram
+        const telegramApiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+        
         const payload = {
             chat_id: CHANNEL_ID,
             text: message,
-            parse_mode: parse_mode || 'MarkdownV2', // Default to MarkdownV2, can also be 'HTML' or none
-            // You can add other parameters like disable_web_page_preview: true
+            parse_mode: 'MarkdownV2'
         };
 
-        // 6. Send the request to Telegram API
         const telegramResponse = await fetch(telegramApiUrl, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload),
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
         });
 
         const telegramResult = await telegramResponse.json();
 
-        // 7. Handle Telegram's response
         if (!telegramResponse.ok || !telegramResult.ok) {
             console.error('Telegram API Error:', telegramResult);
             return res.status(500).json({
                 error: 'Failed to send message to Telegram',
-                telegram_error: telegramResult.description || 'Unknown error',
+                telegram_error: telegramResult.description || 'Unknown error'
             });
         }
 
-        // 8. Send success response back to the client
-        return res.status(200).json({ success: true, message: 'Message sent to Telegram successfully!', telegram_response: telegramResult });
+        // 7. Send success response
+        return res.status(200).json({ 
+            success: true, 
+            message: 'Stock price sent to Telegram successfully!',
+            symbol,
+            price,
+            telegram_response: telegramResult 
+        });
 
     } catch (error) {
-        console.error('Error in send-message handler:', error);
-        return res.status(500).json({ error: 'Internal Server Error', details: error.message });
+        console.error('Error in handler:', error);
+        return res.status(500).json({ 
+            error: 'Internal Server Error', 
+            details: error.message 
+        });
     }
 }
