@@ -10,7 +10,7 @@ export default async function handler(req, res) {
     // 2. Get API keys from Environment Variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const ALPHA_VANTAGE_KEY = 'MTQ00L6WCER4WWBX';
+    const FINNHUB_API_KEY = 'd0iq20pr01qnehifllf0d0iq20pr01qnehifllfg';
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         console.error("Missing Telegram environment variables.");
@@ -25,26 +25,39 @@ export default async function handler(req, res) {
             return res.status(400).json({ error: 'Missing "symbol" in request body' });
         }
 
-        // 4. Fetch stock data from Alpha Vantage (daily time series)
-        const alphaUrl = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${symbol}&apikey=${ALPHA_VANTAGE_KEY}&outputsize=compact`;
-        
-        const alphaResponse = await fetch(alphaUrl);
-        const alphaData = await alphaResponse.json();
+        // 4. Fetch stock data from Finnhub
+        // Get current quote
+        const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
+        const quoteResponse = await fetch(quoteUrl);
+        const quoteData = await quoteResponse.json();
 
-        if (!alphaData['Time Series (Daily)']) {
-            console.error('Alpha Vantage Error:', alphaData);
+        if (!quoteData.c) {
+            console.error('Finnhub Quote Error:', quoteData);
             return res.status(500).json({ 
-                error: 'Failed to fetch stock data',
-                alpha_error: alphaData.Note || alphaData.Information || 'Invalid response'
+                error: 'Failed to fetch quote data',
+                finnhub_error: quoteData.error || 'Invalid response'
+            });
+        }
+
+        // Get historical data for MA calculation
+        const now = Math.floor(Date.now() / 1000);
+        const oneMonthAgo = now - (30 * 24 * 60 * 60);
+        const candlesUrl = `https://finnhub.io/api/v1/stock/candle?symbol=${symbol}&resolution=D&from=${oneMonthAgo}&to=${now}&token=${FINNHUB_API_KEY}`;
+        const candlesResponse = await fetch(candlesUrl);
+        const candlesData = await candlesResponse.json();
+
+        if (!candlesData.c || candlesData.c.length < 20) {
+            console.error('Finnhub Candles Error:', candlesData);
+            return res.status(500).json({ 
+                error: 'Failed to fetch historical data',
+                finnhub_error: candlesData.error || 'Not enough data points'
             });
         }
 
         // 5. Process data and implement strategy
-        const timeSeries = alphaData['Time Series (Daily)'];
-        const dates = Object.keys(timeSeries).sort().reverse(); // Newest first
-        
-        // Extract closing prices for last 20 days
-        const closingPrices = dates.slice(0, 20).map(date => parseFloat(timeSeries[date]['4. close']));
+        const closingPrices = candlesData.c.slice(0, 20); // Last 20 closing prices
+        const currentPrice = quoteData.c;
+        const previousClose = quoteData.pc;
         
         // Calculate 5-day and 20-day moving averages
         const shortTermPeriod = 5;
@@ -53,19 +66,16 @@ export default async function handler(req, res) {
         const shortMA = closingPrices.slice(0, shortTermPeriod).reduce((a, b) => a + b, 0) / shortTermPeriod;
         const longMA = closingPrices.slice(0, longTermPeriod).reduce((a, b) => a + b, 0) / longTermPeriod;
         
-        const currentPrice = closingPrices[0];
-        const previousPrice = closingPrices[1];
-        
         // 6. Generate trading signal
         let signal = "HOLD";
         let reason = "";
         
-        // Simple Moving Average Crossover Strategy
-        if (shortMA > longMA && previousPrice <= longMA) {
+        // Moving Average Crossover Strategy
+        if (shortMA > longMA && previousClose <= longMA) {
             signal = "BUY";
             reason = "5-day MA crossed above 20-day MA";
         } 
-        else if (shortMA < longMA && previousPrice >= longMA) {
+        else if (shortMA < longMA && previousClose >= longMA) {
             signal = "SELL";
             reason = "5-day MA crossed below 20-day MA";
         }
@@ -73,14 +83,14 @@ export default async function handler(req, res) {
         // 7. Format the message
         const message = `📊 ${symbol} Trading Signal
 📈 Current Price: $${currentPrice.toFixed(2)}
-📉 Yesterday's Close: $${previousPrice.toFixed(2)}
+📉 Previous Close: $${previousClose.toFixed(2)}
 📊 5-Day MA: $${shortMA.toFixed(2)}
 📈 20-Day MA: $${longMA.toFixed(2)}
 
 🚦 Signal: ${signal}
 💡 Reason: ${reason}
 
-Data provided by Alpha Vantage`;
+Data provided by Finnhub`;
 
         // 8. Send to Telegram
         const telegramApiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
