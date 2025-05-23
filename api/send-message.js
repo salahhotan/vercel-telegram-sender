@@ -1,141 +1,97 @@
 // api/send-signal.js
-
 export default async function handler(req, res) {
-    // 1. Check if it's a POST request
     if (req.method !== 'POST') {
         res.setHeader('Allow', ['POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
-    // 2. Get API keys from Environment Variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
     const FINNHUB_API_KEY = 'd0iq20pr01qnehifllf0d0iq20pr01qnehifllfg';
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
-        console.error("Missing Telegram environment variables.");
-        return res.status(500).json({ error: 'Server configuration error.' });
+        return res.status(500).json({ error: 'Missing Telegram configuration' });
     }
 
     try {
-        // 3. Get the stock symbol from request body
         const { symbol } = req.body;
-        
-        if (!symbol) {
-            return res.status(400).json({ error: 'Missing "symbol" in request body' });
-        }
+        if (!symbol) return res.status(400).json({ error: 'Missing symbol' });
 
-        // 4. Fetch stock data from Finnhub
-        // Get current quote
+        // 1. Get basic quote data (works with free tier)
         const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
         const quoteData = await quoteResponse.json();
-
+        
         if (!quoteData.c) {
-            console.error('Finnhub Quote Error:', quoteData);
+            console.error('Finnhub Error:', quoteData);
             return res.status(500).json({ 
                 error: 'Failed to fetch quote data',
-                finnhub_error: quoteData.error || 'Invalid response'
+                details: quoteData.error || 'Invalid response'
             });
         }
 
-        // Get historical data for MA calculation
-        const now = Math.floor(Date.now() / 1000);
-        const oneMonthAgo = now - (30 * 24 * 60 * 60);
-        const candlesUrl = `https://finnhub.io/api/v1/stock/candle?symbol=${symbol}&resolution=D&from=${oneMonthAgo}&to=${now}&token=${FINNHUB_API_KEY}`;
-        const candlesResponse = await fetch(candlesUrl);
-        const candlesData = await candlesResponse.json();
+        // 2. Get alternative technical indicators (works with free tier)
+        const indicatorsUrl = `https://finnhub.io/api/v1/scan/technical-indicator?symbol=${symbol}&resolution=D&token=${FINNHUB_API_KEY}`;
+        const indicatorsResponse = await fetch(indicatorsUrl);
+        const indicatorsData = await indicatorsResponse.json();
 
-        if (!candlesData.c || candlesData.c.length < 20) {
-            console.error('Finnhub Candles Error:', candlesData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch historical data',
-                finnhub_error: candlesData.error || 'Not enough data points'
-            });
-        }
-
-        // 5. Process data and implement strategy
-        const closingPrices = candlesData.c.slice(0, 20); // Last 20 closing prices
+        // 3. Simplified strategy using available data
         const currentPrice = quoteData.c;
         const previousClose = quoteData.pc;
+        const priceChange = ((currentPrice - previousClose) / previousClose) * 100;
         
-        // Calculate 5-day and 20-day moving averages
-        const shortTermPeriod = 5;
-        const longTermPeriod = 20;
-        
-        const shortMA = closingPrices.slice(0, shortTermPeriod).reduce((a, b) => a + b, 0) / shortTermPeriod;
-        const longMA = closingPrices.slice(0, longTermPeriod).reduce((a, b) => a + b, 0) / longTermPeriod;
-        
-        // 6. Generate trading signal
         let signal = "HOLD";
         let reason = "";
         
-        // Moving Average Crossover Strategy
-        if (shortMA > longMA && previousClose <= longMA) {
+        // Basic momentum strategy
+        if (priceChange > 1.5) {
             signal = "BUY";
-            reason = "5-day MA crossed above 20-day MA";
-        } 
-        else if (shortMA < longMA && previousClose >= longMA) {
+            reason = "Significant upward momentum (+" + priceChange.toFixed(2) + "%)";
+        } else if (priceChange < -1.5) {
             signal = "SELL";
-            reason = "5-day MA crossed below 20-day MA";
+            reason = "Significant downward momentum (" + priceChange.toFixed(2) + "%)";
+        } else {
+            signal = "HOLD";
+            reason = "Neutral price movement (" + priceChange.toFixed(2) + "%)";
         }
-        
-        // 7. Format the message
-        const message = `📊 ${symbol} Trading Signal
-📈 Current Price: $${currentPrice.toFixed(2)}
-📉 Previous Close: $${previousClose.toFixed(2)}
-📊 5-Day MA: $${shortMA.toFixed(2)}
-📈 20-Day MA: $${longMA.toFixed(2)}
 
+        // 4. Format and send message
+        const message = `📈 ${symbol} Trade Signal
+💵 Current: $${currentPrice.toFixed(2)}
+📊 Change: ${priceChange.toFixed(2)}%
 🚦 Signal: ${signal}
 💡 Reason: ${reason}
 
-Data provided by Finnhub`;
+Generated at: ${new Date().toLocaleString()}`;
 
-        // 8. Send to Telegram
-        const telegramApiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        
-        const payload = {
-            chat_id: CHANNEL_ID,
-            text: message
-        };
-
-        const telegramResponse = await fetch(telegramApiUrl, {
+        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify({
+                chat_id: CHANNEL_ID,
+                text: message
+            })
         });
 
-        const telegramResult = await telegramResponse.json();
-
-        if (!telegramResponse.ok || !telegramResult.ok) {
-            console.error('Telegram API Error:', telegramResult);
-            return res.status(500).json({
-                error: 'Failed to send message to Telegram',
-                telegram_error: telegramResult.description || 'Unknown error'
-            });
+        if (!telegramResponse.ok) {
+            const error = await telegramResponse.json();
+            throw new Error(error.description || 'Telegram API error');
         }
 
-        // 9. Send success response
         return res.status(200).json({ 
-            success: true, 
-            message: 'Trading signal sent to Telegram successfully!',
+            success: true,
             symbol,
             currentPrice,
+            priceChange,
             signal,
-            reason,
-            telegram_response: telegramResult 
+            reason
         });
 
     } catch (error) {
-        console.error('Error in handler:', error);
+        console.error('Error:', error);
         return res.status(500).json({ 
-            error: 'Internal Server Error', 
+            error: 'Internal Server Error',
             details: error.message 
         });
     }
 }
-
-
-
-
