@@ -135,3 +135,7 @@ Data provided by Finnhub`;
         });
     }
 }
+
+
+
+
