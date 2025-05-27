@@ -1,6 +1,6 @@
 // api/send-message.js
 export default async function handler(req, res) {
-    // Support both GET and POST requests
+    // Allow both GET (with query params) and POST (with body)
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
@@ -16,87 +16,53 @@ export default async function handler(req, res) {
 
     try {
         // Get parameters from either query (GET) or body (POST)
-        const { symbol, interval = '15', strategy = 'momentum' } = req.method === 'GET' ? req.query : req.body;
+        const { symbol, interval, strategy } = req.method === 'GET' ? req.query : req.body;
         
         if (!symbol) return res.status(400).json({ error: 'Missing symbol parameter' });
-        if (!['1', '5', '15', '30', '60', 'D', 'W', 'M'].includes(interval)) {
-            return res.status(400).json({ error: 'Invalid interval. Use: 1,5,15,30,60,D,W,M' });
-        }
-        if (!['momentum', 'mean_reversion', 'breakout'].includes(strategy)) {
-            return res.status(400).json({ error: 'Invalid strategy. Use: momentum, mean_reversion, breakout' });
-        }
+        if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
+        if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        // 1. Get quote data with better error handling
+        // 1. Get basic quote data
         const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
-        let quoteData;
+        const quoteResponse = await fetch(quoteUrl);
+        const quoteData = await quoteResponse.json();
         
-        try {
-            const quoteResponse = await fetch(quoteUrl);
-            quoteData = await quoteResponse.json();
-            
-            if (!quoteData || quoteData.error) {
-                console.error('Finnhub Quote Error:', quoteData);
-                return res.status(500).json({ 
-                    error: 'Failed to fetch quote data',
-                    details: quoteData?.error || 'Empty response',
-                    finnhubResponse: quoteData
-                });
-            }
-            
-            if (quoteData.c === undefined || quoteData.pc === undefined) {
-                return res.status(500).json({ 
-                    error: 'Invalid quote data structure',
-                    details: 'Missing required price fields',
-                    finnhubResponse: quoteData
-                });
-            }
-        } catch (error) {
-            console.error('Fetch Quote Error:', error);
+        if (!quoteData.c) {
+            console.error('Finnhub Error:', quoteData);
             return res.status(500).json({ 
                 error: 'Failed to fetch quote data',
-                details: error.message,
-                url: quoteUrl
+                details: quoteData.error || 'Invalid response'
             });
         }
 
-        // 2. Get technical indicators with better error handling
-        let indicatorsData = {};
-        try {
-            const indicatorsUrl = `https://finnhub.io/api/v1/scan/technical-indicator?symbol=${symbol}&resolution=${interval}&token=${FINNHUB_API_KEY}`;
-            const indicatorsResponse = await fetch(indicatorsUrl);
-            indicatorsData = await indicatorsResponse.json();
-            
-            if (indicatorsData.error) {
-                console.warn('Finnhub Indicators Warning:', indicatorsData.error);
-                // Continue with empty indicators data
-                indicatorsData = {};
-            }
-        } catch (error) {
-            console.warn('Fetch Indicators Error:', error);
-            // Continue with empty indicators data
-            indicatorsData = {};
-        }
+        // 2. Get technical indicators with the specified interval
+        const indicatorsUrl = `https://finnhub.io/api/v1/scan/technical-indicator?symbol=${symbol}&resolution=${interval}&token=${FINNHUB_API_KEY}`;
+        const indicatorsResponse = await fetch(indicatorsUrl);
+        const indicatorsData = await indicatorsResponse.json();
 
-        // 3. Apply selected strategy
+        // 3. Generate signal based on strategy
         const currentPrice = quoteData.c;
         const previousClose = quoteData.pc;
         const priceChange = ((currentPrice - previousClose) / previousClose) * 100;
         
         let signal = "HOLD";
         let reason = "";
-        let analysis = {
-            price: currentPrice,
-            previousClose,
-            priceChange,
-            interval,
-            strategy
-        };
-
-        // ... (rest of your strategy logic remains the same)
+        
+        // Basic momentum strategy (same logic as before)
+        if (priceChange > 1.5) {
+            signal = "BUY";
+            reason = `Significant upward momentum (+${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+        } else if (priceChange < -1.5) {
+            signal = "SELL";
+            reason = `Significant downward momentum (${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+        } else {
+            signal = "HOLD";
+            reason = `Neutral price movement (${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+        }
 
         // 4. Format and send message
-        const message = `📈 ${symbol} Trade Signal (${strategy.toUpperCase()})
-⏱️ Timeframe: ${interval}
+        const message = `📈 ${symbol} Trade Signal (${strategy})
+⏰ Interval: ${interval}min
 💵 Current: $${currentPrice.toFixed(2)}
 📊 Change: ${priceChange.toFixed(2)}%
 🚦 Signal: ${signal}
@@ -104,14 +70,37 @@ export default async function handler(req, res) {
 
 Generated at: ${new Date().toLocaleString()}`;
 
-        // ... (rest of your Telegram sending logic)
+        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CHANNEL_ID,
+                text: message,
+                parse_mode: 'Markdown'
+            })
+        });
+
+        if (!telegramResponse.ok) {
+            const error = await telegramResponse.json();
+            throw new Error(error.description || 'Telegram API error');
+        }
+
+        return res.status(200).json({ 
+            success: true,
+            symbol,
+            interval,
+            strategy,
+            currentPrice,
+            priceChange,
+            signal,
+            reason
+        });
 
     } catch (error) {
-        console.error('Unhandled Error:', error);
+        console.error('Error:', error);
         return res.status(500).json({ 
             error: 'Internal Server Error',
-            details: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            details: error.message 
         });
     }
 }
