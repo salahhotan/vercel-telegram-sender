@@ -1,6 +1,4 @@
-// api/send-message.js
 export default async function handler(req, res) {
-    // Allow both GET (with query params) and POST (with body)
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
@@ -15,60 +13,67 @@ export default async function handler(req, res) {
     }
 
     try {
-        // Get parameters from either query (GET) or body (POST)
         const { symbol, interval, strategy } = req.method === 'GET' ? req.query : req.body;
         
         if (!symbol) return res.status(400).json({ error: 'Missing symbol parameter' });
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
+        // Normalize symbol for Finnhub API
+        const finnhubSymbol = symbol.includes('/') 
+            ? `OANDA:${symbol.replace('/', '')}` // Format forex pairs as OANDA:EURUSD
+            : symbol;
+
         // 1. Get basic quote data
-        const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
+        const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${finnhubSymbol}&token=${FINNHUB_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
         const quoteData = await quoteResponse.json();
         
-        if (!quoteData.c) {
+        if (!quoteData.c && !quoteData.currentPrice) {
             console.error('Finnhub Error:', quoteData);
             return res.status(500).json({ 
                 error: 'Failed to fetch quote data',
-                details: quoteData.error || 'Invalid response'
+                details: quoteData.error || 'Invalid symbol or API issue'
             });
         }
 
-        // 2. Get technical indicators with the specified interval
-        const indicatorsUrl = `https://finnhub.io/api/v1/scan/technical-indicator?symbol=${symbol}&resolution=${interval}&token=${FINNHUB_API_KEY}`;
-        const indicatorsResponse = await fetch(indicatorsUrl);
-        const indicatorsData = await indicatorsResponse.json();
+        // Use currentPrice for forex or c for stocks
+        const currentPrice = quoteData.currentPrice || quoteData.c;
+        const previousClose = quoteData.previousClose || quoteData.pc;
+        
+        if (currentPrice === undefined || previousClose === undefined) {
+            return res.status(400).json({ 
+                error: 'Invalid symbol format',
+                details: `Use 'EURUSD' or 'OANDA:EURUSD' for forex, 'AAPL' for stocks`
+            });
+        }
 
-        // 3. Generate signal based on strategy
-        const currentPrice = quoteData.c;
-        const previousClose = quoteData.pc;
         const priceChange = ((currentPrice - previousClose) / previousClose) * 100;
         
         let signal = "HOLD";
         let reason = "";
         
-        // Basic momentum strategy (same logic as before)
+        // Strategy logic
         if (priceChange > 1.5) {
             signal = "BUY";
-            reason = `Significant upward momentum (+${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+            reason = `Strong uptrend (+${priceChange.toFixed(2)}%) on ${interval}min chart`;
         } else if (priceChange < -1.5) {
             signal = "SELL";
-            reason = `Significant downward momentum (${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+            reason = `Strong downtrend (${priceChange.toFixed(2)}%) on ${interval}min chart`;
         } else {
             signal = "HOLD";
-            reason = `Neutral price movement (${priceChange.toFixed(2)}%) using ${strategy} strategy on ${interval}min chart`;
+            reason = `Neutral movement (${priceChange.toFixed(2)}%) on ${interval}min chart`;
         }
 
-        // 4. Format and send message
+        // Format message
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
-💵 Current: $${currentPrice.toFixed(2)}
+💵 Price: ${currentPrice.toFixed(5)}
 📊 Change: ${priceChange.toFixed(2)}%
 🚦 Signal: ${signal}
 💡 Reason: ${reason}
 
-Generated at: ${new Date().toLocaleString()}`;
+🕒 ${new Date().toLocaleString()}`;
 
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
