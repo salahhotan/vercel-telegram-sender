@@ -1,6 +1,7 @@
+// signal-checker.js
 export default async function handler(req, res) {
-    if (req.method !== 'GET' && req.method !== 'POST') {
-        res.setHeader('Allow', ['GET', 'POST']);
+    if (req.method !== 'POST') {
+        res.setHeader('Allow', ['POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
@@ -13,137 +14,141 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 1. Get the last message from the Telegram channel
-        // Note: Using getUpdates instead of getChatHistory which requires special permissions
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
-        const updatesResponse = await fetch(getUpdatesUrl);
-        const updatesData = await updatesResponse.json();
+        const { checkAfterMinutes = 15, lookbackMinutes = 60 } = req.body;
 
-        if (!updatesResponse.ok || !updatesData.result) {
-            console.error('Telegram API Error:', updatesData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch messages',
-                details: updatesData.description || 'Check bot permissions'
-            });
+        // 1. Get recent messages from Telegram channel
+        const telegramMessagesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=20`;
+        const messagesResponse = await fetch(telegramMessagesUrl);
+        const messagesData = await messagesResponse.json();
+
+        if (!messagesData.ok || !messagesData.result) {
+            throw new Error('Failed to fetch Telegram messages');
         }
 
-        // Find the last message sent by the bot to the channel
-        const channelMessages = updatesData.result
-            .filter(update => update.channel_post && update.channel_post.chat.id.toString() === CHANNEL_ID.toString())
-            .map(update => update.channel_post);
+        // 2. Parse messages to find trade signals
+        const signals = [];
+        const signalRegex = /📈 (.+?) Trade Signal(.+?)💰 Price: (.+?).+?🚦 Signal: (.+?)\n/s;
 
-        if (channelMessages.length === 0) {
-            return res.status(404).json({ 
-                error: 'No messages found in channel',
-                details: 'Make sure the bot is admin and has posted messages'
-            });
-        }
+        messagesData.result.messages.forEach(msg => {
+            if (msg.text) {
+                const match = msg.text.match(signalRegex);
+                if (match) {
+                    const symbol = match[1].trim();
+                    const price = parseFloat(match[3].trim());
+                    const signal = match[4].trim();
+                    const timestamp = msg.date * 1000; // Convert to milliseconds
 
-        const lastMessage = channelMessages[channelMessages.length - 1];
-        const messageText = lastMessage.text;
-
-        // 2. Parse the last signal from the message (rest of the code remains the same)
-        const signalRegex = /🚦 Signal: (BUY|SELL|HOLD)/;
-        const symbolRegex = /📈 (\S+) Trade Signal/;
-        const intervalRegex = /⏰ Interval: (\d+)min/;
-        const priceRegex = /💵 Price: (\d+\.\d+)/;
-
-        const signalMatch = messageText.match(signalRegex);
-        const symbolMatch = messageText.match(symbolRegex);
-        const intervalMatch = messageText.match(intervalRegex);
-        const priceMatch = messageText.match(priceRegex);
-
-        if (!signalMatch || !symbolMatch || !intervalMatch || !priceMatch) {
-            return res.status(400).json({ 
-                error: 'Could not parse signal information from last message',
-                details: 'Message format mismatch'
-            });
-        }
-
-        const signal = signalMatch[1];
-        const symbol = symbolMatch[1];
-        const interval = parseInt(intervalMatch[1]);
-        const entryPrice = parseFloat(priceMatch[1]);
-
-        if (signal === 'HOLD') {
-            return res.status(200).json({ 
-                success: true,
-                message: 'Last signal was HOLD - no result to verify'
-            });
-        }
-
-        // 3. Get the next candle's data to verify the signal
-        const twelveDataSymbol = symbol.includes('/') ? `${symbol.replace('/', '/')}` : symbol;
-
-        // Get enough candles to cover the interval period
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=2`;
-        const timeSeriesResponse = await fetch(timeSeriesUrl);
-        const timeSeriesData = await timeSeriesResponse.json();
-
-        if (timeSeriesData.status === 'error' || !timeSeriesData.values) {
-            console.error('TwelveData Error:', timeSeriesData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch time series data',
-                details: timeSeriesData.message || 'Invalid symbol or API issue'
-            });
-        }
-
-        // The first value is the most recent, we want the next one after our signal
-        const nextCandle = timeSeriesData.values[1];
-        if (!nextCandle) {
-            return res.status(404).json({ 
-                error: 'Next candle data not available yet',
-                details: 'Wait for the next candle to close'
-            });
-        }
-
-        const exitPrice = parseFloat(nextCandle.close);
-        const priceChange = ((exitPrice - entryPrice) / entryPrice) * 100;
-
-        // 4. Determine if the signal was successful
-        let result;
-        if (signal === 'BUY' && priceChange > 0) {
-            result = 'WIN';
-        } else if (signal === 'SELL' && priceChange < 0) {
-            result = 'WIN';
-        } else {
-            result = 'LOSS';
-        }
-
-        // 5. Send the result back to the channel
-        const resultMessage = `📊 ${symbol} Signal Result
-⏰ Interval: ${interval}min
-📈 Signal: ${signal} @ ${entryPrice.toFixed(5)}
-📉 Exit: ${exitPrice.toFixed(5)} (${priceChange.toFixed(2)}%)
-🏆 Result: ${result}
-
-🔍 ${new Date().toLocaleString()}`;
-
-        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: CHANNEL_ID,
-                text: resultMessage,
-                parse_mode: 'Markdown',
-                reply_to_message_id: lastMessage.message_id
-            })
+                    signals.push({
+                        messageId: msg.message_id,
+                        symbol,
+                        price,
+                        signal,
+                        timestamp,
+                        originalMessage: msg.text
+                    });
+                }
+            }
         });
 
-        if (!telegramResponse.ok) {
-            const error = await telegramResponse.json();
-            throw new Error(error.description || 'Telegram API error');
+        if (signals.length === 0) {
+            return res.status(200).json({ 
+                success: true,
+                message: 'No trade signals found in recent messages',
+                signalsChecked: 0
+            });
+        }
+
+        // 3. Process each signal that's older than lookback period
+        const now = Date.now();
+        const results = [];
+
+        for (const signal of signals) {
+            const signalAgeMinutes = (now - signal.timestamp) / (1000 * 60);
+            
+            // Only check signals that are older than our checkAfterMinutes but within lookback window
+            if (signalAgeMinutes >= checkAfterMinutes && signalAgeMinutes <= lookbackMinutes) {
+                // Get current price
+                const twelveDataSymbol = signal.symbol.includes('/') 
+                    ? `${signal.symbol.replace('/', '/')}`
+                    : signal.symbol;
+
+                const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=1min&apikey=${TWELVEDATA_API_KEY}&outputsize=1`;
+                const timeSeriesResponse = await fetch(timeSeriesUrl);
+                const timeSeriesData = await timeSeriesResponse.json();
+                
+                if (timeSeriesData.status === 'error' || !timeSeriesData.values) {
+                    console.error(`Failed to fetch price for ${signal.symbol}`);
+                    continue;
+                }
+
+                const currentPrice = parseFloat(timeSeriesData.values[0].close);
+                const priceChange = ((currentPrice - signal.price) / signal.price) * 100;
+                
+                let result = "NEUTRAL";
+                let profitLoss = 0;
+                let reason = "";
+
+                // Determine result
+                if (signal.signal === "BUY") {
+                    profitLoss = currentPrice - signal.price;
+                    if (currentPrice > signal.price) {
+                        result = "WIN";
+                        reason = `Price increased by ${priceChange.toFixed(2)}%`;
+                    } else if (currentPrice < signal.price) {
+                        result = "LOSS";
+                        reason = `Price decreased by ${Math.abs(priceChange).toFixed(2)}%`;
+                    }
+                } else if (signal.signal === "SELL") {
+                    profitLoss = signal.price - currentPrice;
+                    if (currentPrice < signal.price) {
+                        result = "WIN";
+                        reason = `Price decreased by ${Math.abs(priceChange).toFixed(2)}%`;
+                    } else if (currentPrice > signal.price) {
+                        result = "LOSS";
+                        reason = `Price increased by ${priceChange.toFixed(2)}%`;
+                    }
+                }
+
+                // Format result message
+                const resultMessage = `📊 ${signal.symbol} Signal Result (after ${checkAfterMinutes}min)
+⏰ Signal Time: ${new Date(signal.timestamp).toLocaleString()}
+💰 Entry Price: ${signal.price.toFixed(5)}
+📈 Current Price: ${currentPrice.toFixed(5)}
+📉 P/L: ${profitLoss.toFixed(5)} (${priceChange.toFixed(2)}%)
+🏆 Result: ${result}
+💡 Details: ${reason}
+
+🔍 Original Signal: ${signal.signal}`;
+
+                // Post result to Telegram (as a reply to original message)
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: CHANNEL_ID,
+                        text: resultMessage,
+                        parse_mode: 'Markdown',
+                        reply_to_message_id: signal.messageId
+                    })
+                });
+
+                results.push({
+                    symbol: signal.symbol,
+                    originalSignal: signal.signal,
+                    entryPrice: signal.price,
+                    currentPrice,
+                    profitLoss,
+                    priceChange,
+                    result,
+                    durationMinutes: checkAfterMinutes
+                });
+            }
         }
 
         return res.status(200).json({ 
             success: true,
-            symbol,
-            interval,
-            signal,
-            entryPrice,
-            exitPrice,
-            priceChange,
-            result
+            signalsChecked: results.length,
+            results
         });
 
     } catch (error) {
