@@ -1,83 +1,3 @@
-// Helper functions for Technical Analysis
-// These replicate the logic from the Pine Script
-
-/**
- * Calculates the Exponential Moving Average (EMA) for a given dataset.
- * @param {number[]} data - Array of prices (e.g., close, high, low).
- * @param {number} period - The EMA period (e.g., 21).
- * @returns {number[]} - Array of EMA values.
- */
-function calculateEMA(data, period) {
-    if (data.length < period) return [];
-    const k = 2 / (period + 1);
-    const emaArray = [data[0]]; // Start with the first price
-    for (let i = 1; i < data.length; i++) {
-        const ema = (data[i] * k) + (emaArray[i - 1] * (1 - k));
-        emaArray.push(ema);
-    }
-    return emaArray;
-}
-
-/**
- * Calculates the Simple Moving Average (SMA) for a given dataset.
- * @param {number[]} data - Array of values.
- * @param {number} period - The SMA period.
- * @returns {number[]} - Array of SMA values.
- */
-function calculateSMA(data, period) {
-    if (data.length < period) return [];
-    const smaArray = [];
-    for (let i = period - 1; i < data.length; i++) {
-        const chunk = data.slice(i - period + 1, i + 1);
-        const sum = chunk.reduce((acc, val) => acc + val, 0);
-        smaArray.push(sum / period);
-    }
-    // Pad the beginning with nulls to match original data length for easier indexing
-    const padding = new Array(period - 1).fill(null);
-    return [...padding, ...smaArray];
-}
-
-/**
- * Calculates the Stochastic Oscillator (%K and %D).
- * @param {object} params - The required data and periods.
- * @param {number[]} params.highs - Array of high prices.
- * @param {number[]} params.lows - Array of low prices.
- * @param {number[]} params.closes - Array of close prices.
- * @param {number} params.period - The main Stochastic period (length1).
- * @param {number} params.smoothK - The smoothing period for %K.
- * @param {number} params.smoothD - The smoothing period for %D.
- * @returns {{stochK: number[], stochD: number[]}} - The calculated %K and %D lines.
- */
-function calculateStochastic({ highs, lows, closes, period, smoothK, smoothD }) {
-    if (closes.length < period) return { stochK: [], stochD: [] };
-
-    const stochValues = [];
-    for (let i = period - 1; i < closes.length; i++) {
-        const priceChunk = closes.slice(i - period + 1, i + 1);
-        const highChunk = highs.slice(i - period + 1, i + 1);
-        const lowChunk = lows.slice(i - period + 1, i + 1);
-
-        const lowestLow = Math.min(...lowChunk);
-        const highestHigh = Math.max(...highChunk);
-        const currentClose = priceChunk[priceChunk.length - 1];
-        
-        const stoch = 100 * ((currentClose - lowestLow) / (highestHigh - lowestLow));
-        stochValues.push(stoch);
-    }
-
-    // Pad the beginning to align with the original data length
-    const padding = new Array(period - 1).fill(null);
-    const fullStoch = [...padding, ...stochValues];
-
-    const k_line = calculateSMA(fullStoch.filter(v => v !== null), smoothK);
-    const d_line = calculateSMA(k_line.filter(v => v !== null), smoothD);
-
-    return { stochK: k_line, stochD: d_line };
-}
-
-
-// --- API Handler ---
-
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
@@ -99,11 +19,13 @@ export default async function handler(req, res) {
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        const twelveDataSymbol = symbol.replace('/', '');
+        // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
+        const twelveDataSymbol = symbol.includes('/') 
+            ? `${symbol.replace('/', '/')}` // Keep as EUR/USD for forex
+            : symbol;
 
-        // 1. Get time series data. We need more data for indicator calculations.
-        const dataPoints = 100; // A safe number for up to 21-period EMAs/Stoch
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=${dataPoints}`;
+        // 1. Get time series data for price change calculation
+        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
         const timeSeriesData = await timeSeriesResponse.json();
         
@@ -114,77 +36,113 @@ export default async function handler(req, res) {
                 details: timeSeriesData.message || 'Invalid symbol or API issue'
             });
         }
-        
-        // 2. Prepare data for TA functions (API returns newest-first, we need oldest-first)
-        const historicalData = timeSeriesData.values.reverse();
-        const opens = historicalData.map(d => parseFloat(d.open));
-        const highs = historicalData.map(d => parseFloat(d.high));
-        const lows = historicalData.map(d => parseFloat(d.low));
-        const closes = historicalData.map(d => parseFloat(d.close));
 
-        if (closes.length < 21) { // 21 is the longest period in the strategy
-             return res.status(500).json({ error: 'Not enough historical data to apply strategy.' });
+        // 2. Get current quote data
+        const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
+        const quoteResponse = await fetch(quoteUrl);
+        const quoteData = await quoteResponse.json();
+        
+        if (quoteData.status === 'error') {
+            console.error('TwelveData Error:', quoteData);
+            return res.status(500).json({ 
+                error: 'Failed to fetch quote data',
+                details: quoteData.message || 'Invalid symbol or API issue'
+            });
         }
 
-        // 3. Define strategy parameters from the Pine Script
-        const stochParams = { length1: 14, smoothK: 1, smoothD: 3 };
-        const highEmaLen = 4;
-        const lowEmaLen = 4;
-        const closeEmaLen = 21;
-
-        // 4. Calculate all indicators
-        const emaHigh = calculateEMA(highs, highEmaLen);
-        const emaLow = calculateEMA(lows, lowEmaLen);
-        const emaClose = calculateEMA(closes, closeEmaLen);
-        const { stochK, stochD } = calculateStochastic({ 
-            highs, lows, closes, 
-            period: stochParams.length1, 
-            smoothK: stochParams.smoothK, 
-            smoothD: stochParams.smoothD 
-        });
-
-        // 5. Get the latest values for the current candle
-        const currentOpen = opens[opens.length - 1];
-        const currentClose = closes[closes.length - 1];
-        const latestEmaHigh = emaHigh[emaHigh.length - 1];
-        const latestEmaLow = emaLow[emaLow.length - 1];
-        const midChannel = (latestEmaHigh + latestEmaLow) / 2;
-        const latestEmaClose = emaClose[emaClose.length - 1];
-        const latestK = stochK[stochK.length - 1];
-        const latestD = stochD[stochD.length - 1];
-
-        // 6. Apply the strategy logic
-        let signal = "HOLD";
-        let reason = "Conditions for a signal were not met.";
+        // Extract price data
+        const values = timeSeriesData.values.reverse(); // Reverse to get chronological order
+        const closes = values.map(v => parseFloat(v.close));
+        const highs = values.map(v => parseFloat(v.high));
+        const lows = values.map(v => parseFloat(v.low));
+        const opens = values.map(v => parseFloat(v.open));
         
-        const isBuySignal = currentClose < latestEmaLow && 
-                            currentOpen < midChannel && 
-                            currentClose < latestEmaClose && 
-                            latestD < 50 && 
-                            latestK < 50;
+        // Current price data
+        const currentClose = closes[closes.length - 1];
+        const currentOpen = opens[opens.length - 1];
+        const currentHigh = highs[highs.length - 1];
+        const currentLow = lows[lows.length - 1];
 
-        const isSellSignal = currentClose > latestEmaHigh && 
-                             currentOpen > midChannel && 
-                             currentClose > latestEmaClose && 
-                             latestD > 50 && 
-                             latestK > 50;
+        // Helper functions for indicators
+        function sma(values, period) {
+            const result = [];
+            for (let i = period - 1; i < values.length; i++) {
+                const sum = values.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
+                result.push(sum / period);
+            }
+            return result;
+        }
 
-        if (isBuySignal) {
-            signal = "BUY"; // "UP" in Pine Script
-            reason = "Close is below low EMA channel and 21-EMA, Open is below mid-channel, and Stochastics are below 50.";
-        } else if (isSellSignal) {
-            signal = "SELL"; // "DOWN" in Pine Script
-            reason = "Close is above high EMA channel and 21-EMA, Open is above mid-channel, and Stochastics are above 50.";
+        function stoch(close, high, low, period) {
+            const result = [];
+            for (let i = period - 1; i < close.length; i++) {
+                const highestHigh = Math.max(...high.slice(i - period + 1, i + 1));
+                const lowestLow = Math.min(...low.slice(i - period + 1, i + 1));
+                const currentClose = close[i];
+                const stochValue = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+                result.push(stochValue);
+            }
+            return result;
+        }
+
+        function ema(values, period) {
+            const k = 2 / (period + 1);
+            const result = [values[0]];
+            for (let i = 1; i < values.length; i++) {
+                result.push(values[i] * k + result[i - 1] * (1 - k));
+            }
+            return result;
+        }
+
+        // Calculate indicators
+        // Stochastics
+        const stochValues = stoch(closes, highs, lows, 14);
+        const k = sma(stochValues, 1);
+        const d = sma(k, 3);
+        const currentK = k[k.length - 1];
+        const currentD = d[d.length - 1];
+
+        // EMAs
+        const highEma = ema(highs, 4);
+        const lowEma = ema(lows, 4);
+        const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
+        const ema21 = ema(closes, 21);
+        const currentEma21 = ema21[ema21.length - 1];
+
+        // Strategy conditions
+        const buyCondition = currentClose < lowEma[lowEma.length - 1] && 
+                            currentOpen < hl2 && 
+                            currentClose < currentEma21 && 
+                            currentD < 50 && 
+                            currentK < 50;
+
+        const sellCondition = currentClose > highEma[highEma.length - 1] && 
+                             currentOpen > hl2 && 
+                             currentClose > currentEma21 && 
+                             currentD > 50 && 
+                             currentK > 50;
+
+        let signal = "HOLD";
+        let reason = "";
+        
+        if (buyCondition) {
+            signal = "BUY";
+            reason = `EMA/Stoch strategy BUY signal: Close below Low EMA, Open below HL2, Close below 21 EMA, Stoch K/D below 50 (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
+        } else if (sellCondition) {
+            signal = "SELL";
+            reason = `EMA/Stoch strategy SELL signal: Close above High EMA, Open above HL2, Close above 21 EMA, Stoch K/D above 50 (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         } else {
             signal = "HOLD";
-            reason = `Neutral. Stoch(K,D): ${latestK.toFixed(2)},${latestD.toFixed(2)}. Price vs EMAs did not align.`;
+            reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        // 7. Format and send the message
+        // Format message
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
 💵 Price: ${currentClose.toFixed(5)}
-🚦 Signal: *${signal}*
+📊 EMA21: ${currentEma21.toFixed(5)}
+📉 Stoch K/D: ${currentK.toFixed(2)}/${currentD.toFixed(2)}
+🚦 Signal: ${signal}
 💡 Reason: ${reason}
 
 🕒 ${new Date().toLocaleString()}`;
@@ -209,16 +167,12 @@ export default async function handler(req, res) {
             symbol,
             interval,
             strategy,
+            currentPrice: currentClose,
+            ema21: currentEma21,
+            stochK: currentK,
+            stochD: currentD,
             signal,
-            reason,
-            data: {
-                currentPrice: currentClose,
-                emaHigh: latestEmaHigh,
-                emaLow: latestEmaLow,
-                emaClose: latestEmaClose,
-                stochK: latestK,
-                stochD: latestD
-            }
+            reason
         });
 
     } catch (error) {
