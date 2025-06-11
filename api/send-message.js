@@ -1,3 +1,83 @@
+// Helper functions for Technical Analysis
+// These replicate the logic from the Pine Script
+
+/**
+ * Calculates the Exponential Moving Average (EMA) for a given dataset.
+ * @param {number[]} data - Array of prices (e.g., close, high, low).
+ * @param {number} period - The EMA period (e.g., 21).
+ * @returns {number[]} - Array of EMA values.
+ */
+function calculateEMA(data, period) {
+    if (data.length < period) return [];
+    const k = 2 / (period + 1);
+    const emaArray = [data[0]]; // Start with the first price
+    for (let i = 1; i < data.length; i++) {
+        const ema = (data[i] * k) + (emaArray[i - 1] * (1 - k));
+        emaArray.push(ema);
+    }
+    return emaArray;
+}
+
+/**
+ * Calculates the Simple Moving Average (SMA) for a given dataset.
+ * @param {number[]} data - Array of values.
+ * @param {number} period - The SMA period.
+ * @returns {number[]} - Array of SMA values.
+ */
+function calculateSMA(data, period) {
+    if (data.length < period) return [];
+    const smaArray = [];
+    for (let i = period - 1; i < data.length; i++) {
+        const chunk = data.slice(i - period + 1, i + 1);
+        const sum = chunk.reduce((acc, val) => acc + val, 0);
+        smaArray.push(sum / period);
+    }
+    // Pad the beginning with nulls to match original data length for easier indexing
+    const padding = new Array(period - 1).fill(null);
+    return [...padding, ...smaArray];
+}
+
+/**
+ * Calculates the Stochastic Oscillator (%K and %D).
+ * @param {object} params - The required data and periods.
+ * @param {number[]} params.highs - Array of high prices.
+ * @param {number[]} params.lows - Array of low prices.
+ * @param {number[]} params.closes - Array of close prices.
+ * @param {number} params.period - The main Stochastic period (length1).
+ * @param {number} params.smoothK - The smoothing period for %K.
+ * @param {number} params.smoothD - The smoothing period for %D.
+ * @returns {{stochK: number[], stochD: number[]}} - The calculated %K and %D lines.
+ */
+function calculateStochastic({ highs, lows, closes, period, smoothK, smoothD }) {
+    if (closes.length < period) return { stochK: [], stochD: [] };
+
+    const stochValues = [];
+    for (let i = period - 1; i < closes.length; i++) {
+        const priceChunk = closes.slice(i - period + 1, i + 1);
+        const highChunk = highs.slice(i - period + 1, i + 1);
+        const lowChunk = lows.slice(i - period + 1, i + 1);
+
+        const lowestLow = Math.min(...lowChunk);
+        const highestHigh = Math.max(...highChunk);
+        const currentClose = priceChunk[priceChunk.length - 1];
+        
+        const stoch = 100 * ((currentClose - lowestLow) / (highestHigh - lowestLow));
+        stochValues.push(stoch);
+    }
+
+    // Pad the beginning to align with the original data length
+    const padding = new Array(period - 1).fill(null);
+    const fullStoch = [...padding, ...stochValues];
+
+    const k_line = calculateSMA(fullStoch.filter(v => v !== null), smoothK);
+    const d_line = calculateSMA(k_line.filter(v => v !== null), smoothD);
+
+    return { stochK: k_line, stochD: d_line };
+}
+
+
+// --- API Handler ---
+
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
@@ -19,13 +99,11 @@ export default async function handler(req, res) {
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
-        const twelveDataSymbol = symbol.includes('/') 
-            ? `${symbol.replace('/', '/')}` // Keep as EUR/USD for forex
-            : symbol;
+        const twelveDataSymbol = symbol.replace('/', '');
 
-        // 1. Get time series data for price change calculation
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=2`;
+        // 1. Get time series data. We need more data for indicator calculations.
+        const dataPoints = 100; // A safe number for up to 21-period EMAs/Stoch
+        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=${dataPoints}`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
         const timeSeriesData = await timeSeriesResponse.json();
         
@@ -36,54 +114,77 @@ export default async function handler(req, res) {
                 details: timeSeriesData.message || 'Invalid symbol or API issue'
             });
         }
-
-        // 2. Get current quote data
-        const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
-        const quoteResponse = await fetch(quoteUrl);
-        const quoteData = await quoteResponse.json();
         
-        if (quoteData.status === 'error') {
-            console.error('TwelveData Error:', quoteData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch quote data',
-                details: quoteData.message || 'Invalid symbol or API issue'
-            });
+        // 2. Prepare data for TA functions (API returns newest-first, we need oldest-first)
+        const historicalData = timeSeriesData.values.reverse();
+        const opens = historicalData.map(d => parseFloat(d.open));
+        const highs = historicalData.map(d => parseFloat(d.high));
+        const lows = historicalData.map(d => parseFloat(d.low));
+        const closes = historicalData.map(d => parseFloat(d.close));
+
+        if (closes.length < 21) { // 21 is the longest period in the strategy
+             return res.status(500).json({ error: 'Not enough historical data to apply strategy.' });
         }
 
-        // Extract prices - using the latest from time series and previous close from quote
-        const currentPrice = parseFloat(timeSeriesData.values[0].close);
-        const previousClose = parseFloat(quoteData.close);
-        
-        if (isNaN(currentPrice) || isNaN(previousClose)) {
-            return res.status(400).json({ 
-                error: 'Invalid price data received',
-                details: `Verify the symbol format (e.g., 'EUR/USD' for forex, 'AAPL' for stocks)`
-            });
-        }
+        // 3. Define strategy parameters from the Pine Script
+        const stochParams = { length1: 14, smoothK: 1, smoothD: 3 };
+        const highEmaLen = 4;
+        const lowEmaLen = 4;
+        const closeEmaLen = 21;
 
-        const priceChange = ((currentPrice - previousClose) / previousClose) * 100;
-        
+        // 4. Calculate all indicators
+        const emaHigh = calculateEMA(highs, highEmaLen);
+        const emaLow = calculateEMA(lows, lowEmaLen);
+        const emaClose = calculateEMA(closes, closeEmaLen);
+        const { stochK, stochD } = calculateStochastic({ 
+            highs, lows, closes, 
+            period: stochParams.length1, 
+            smoothK: stochParams.smoothK, 
+            smoothD: stochParams.smoothD 
+        });
+
+        // 5. Get the latest values for the current candle
+        const currentOpen = opens[opens.length - 1];
+        const currentClose = closes[closes.length - 1];
+        const latestEmaHigh = emaHigh[emaHigh.length - 1];
+        const latestEmaLow = emaLow[emaLow.length - 1];
+        const midChannel = (latestEmaHigh + latestEmaLow) / 2;
+        const latestEmaClose = emaClose[emaClose.length - 1];
+        const latestK = stochK[stochK.length - 1];
+        const latestD = stochD[stochD.length - 1];
+
+        // 6. Apply the strategy logic
         let signal = "HOLD";
-        let reason = "";
+        let reason = "Conditions for a signal were not met.";
         
-        // Strategy logic (same as before)
-        if (priceChange > 1.5) {
-            signal = "BUY";
-            reason = `Strong uptrend (+${priceChange.toFixed(2)}%) on ${interval}min chart`;
-        } else if (priceChange < -1.5) {
-            signal = "SELL";
-            reason = `Strong downtrend (${priceChange.toFixed(2)}%) on ${interval}min chart`;
+        const isBuySignal = currentClose < latestEmaLow && 
+                            currentOpen < midChannel && 
+                            currentClose < latestEmaClose && 
+                            latestD < 50 && 
+                            latestK < 50;
+
+        const isSellSignal = currentClose > latestEmaHigh && 
+                             currentOpen > midChannel && 
+                             currentClose > latestEmaClose && 
+                             latestD > 50 && 
+                             latestK > 50;
+
+        if (isBuySignal) {
+            signal = "BUY"; // "UP" in Pine Script
+            reason = "Close is below low EMA channel and 21-EMA, Open is below mid-channel, and Stochastics are below 50.";
+        } else if (isSellSignal) {
+            signal = "SELL"; // "DOWN" in Pine Script
+            reason = "Close is above high EMA channel and 21-EMA, Open is above mid-channel, and Stochastics are above 50.";
         } else {
             signal = "HOLD";
-            reason = `Neutral movement (${priceChange.toFixed(2)}%) on ${interval}min chart`;
+            reason = `Neutral. Stoch(K,D): ${latestK.toFixed(2)},${latestD.toFixed(2)}. Price vs EMAs did not align.`;
         }
 
-        // Format message (same as before)
+        // 7. Format and send the message
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
-💵 Price: ${currentPrice.toFixed(5)}
-📊 Change: ${priceChange.toFixed(2)}%
-🚦 Signal: ${signal}
+💵 Price: ${currentClose.toFixed(5)}
+🚦 Signal: *${signal}*
 💡 Reason: ${reason}
 
 🕒 ${new Date().toLocaleString()}`;
@@ -108,10 +209,16 @@ export default async function handler(req, res) {
             symbol,
             interval,
             strategy,
-            currentPrice,
-            priceChange,
             signal,
-            reason
+            reason,
+            data: {
+                currentPrice: currentClose,
+                emaHigh: latestEmaHigh,
+                emaLow: latestEmaLow,
+                emaClose: latestEmaClose,
+                stochK: latestK,
+                stochD: latestD
+            }
         });
 
     } catch (error) {
