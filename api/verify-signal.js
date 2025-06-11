@@ -14,18 +14,35 @@ export default async function handler(req, res) {
 
     try {
         // 1. Get the last message from the Telegram channel
-        const getMessagesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`;
-        const messagesResponse = await fetch(getMessagesUrl);
-        const messagesData = await messagesResponse.json();
+        // Note: Using getUpdates instead of getChatHistory which requires special permissions
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
+        const updatesResponse = await fetch(getUpdatesUrl);
+        const updatesData = await updatesResponse.json();
 
-        if (!messagesResponse.ok || !messagesData.result || messagesData.result.length === 0) {
-            return res.status(404).json({ error: 'No messages found in channel' });
+        if (!updatesResponse.ok || !updatesData.result) {
+            console.error('Telegram API Error:', updatesData);
+            return res.status(500).json({ 
+                error: 'Failed to fetch messages',
+                details: updatesData.description || 'Check bot permissions'
+            });
         }
 
-        const lastMessage = messagesData.result[0];
+        // Find the last message sent by the bot to the channel
+        const channelMessages = updatesData.result
+            .filter(update => update.channel_post && update.channel_post.chat.id.toString() === CHANNEL_ID.toString())
+            .map(update => update.channel_post);
+
+        if (channelMessages.length === 0) {
+            return res.status(404).json({ 
+                error: 'No messages found in channel',
+                details: 'Make sure the bot is admin and has posted messages'
+            });
+        }
+
+        const lastMessage = channelMessages[channelMessages.length - 1];
         const messageText = lastMessage.text;
 
-        // 2. Parse the last signal from the message
+        // 2. Parse the last signal from the message (rest of the code remains the same)
         const signalRegex = /🚦 Signal: (BUY|SELL|HOLD)/;
         const symbolRegex = /📈 (\S+) Trade Signal/;
         const intervalRegex = /⏰ Interval: (\d+)min/;
@@ -37,7 +54,10 @@ export default async function handler(req, res) {
         const priceMatch = messageText.match(priceRegex);
 
         if (!signalMatch || !symbolMatch || !intervalMatch || !priceMatch) {
-            return res.status(400).json({ error: 'Could not parse signal information from last message' });
+            return res.status(400).json({ 
+                error: 'Could not parse signal information from last message',
+                details: 'Message format mismatch'
+            });
         }
 
         const signal = signalMatch[1];
@@ -71,7 +91,10 @@ export default async function handler(req, res) {
         // The first value is the most recent, we want the next one after our signal
         const nextCandle = timeSeriesData.values[1];
         if (!nextCandle) {
-            return res.status(404).json({ error: 'Next candle data not available yet' });
+            return res.status(404).json({ 
+                error: 'Next candle data not available yet',
+                details: 'Wait for the next candle to close'
+            });
         }
 
         const exitPrice = parseFloat(nextCandle.close);
