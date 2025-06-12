@@ -4,6 +4,9 @@
  *
  * This function is useful for "bumping" or reposting important announcements.
  * It's designed to be triggered by a cron job or a manual request.
+ *
+ * VERSION 2: Now correctly handles both standard text messages and media (photos/videos)
+ * with captions.
  */
 export default async function handler(req, res) {
     // Allow both GET (for easy browser testing) and POST (semantically correct)
@@ -12,7 +15,6 @@ export default async function handler(req, res) {
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
-    // 1. Get required environment variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
@@ -22,8 +24,7 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 2. Fetch the last message from the channel
-        // We use `offset: -1` and `limit: 1` to efficiently get only the most recent update.
+        // 1. Fetch the last message from the channel
         const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&offset=-1`;
 
         const updatesResponse = await fetch(getUpdatesUrl);
@@ -37,18 +38,29 @@ export default async function handler(req, res) {
             });
         }
 
-        // The API returns an array of "updates". We need the first (and only) one.
         const lastUpdate = updatesData.result[0];
-        
-        // A message in a channel is a `channel_post`. We check for `message` as a fallback.
         const lastMessage = lastUpdate.channel_post || lastUpdate.message;
 
-        if (!lastMessage || !lastMessage.text) {
-             return res.status(404).json({ error: 'The last item in the channel was not a text message and cannot be reposted.' });
+        if (!lastMessage) {
+            return res.status(404).json({ error: 'Could not identify a valid message in the last update.' });
         }
 
-        // Extract the text from the last message
-        const messageTextToRepost = lastMessage.text;
+        // 2. *** THE FIX IS HERE ***
+        // Extract the text content, whether it's in the 'text' field (for normal messages)
+        // or the 'caption' field (for media messages).
+        const messageContent = lastMessage.text || lastMessage.caption;
+        
+        // Determine if the original message had formatting (like bold, italic, etc.)
+        // For text messages, entities are in `entities`. For captions, they are in `caption_entities`.
+        const hasFormatting = lastMessage.entities || lastMessage.caption_entities;
+
+        // If after checking both text and caption, we still have nothing, then it's a non-text message (e.g., a sticker).
+        if (!messageContent) {
+            return res.status(404).json({
+                error: 'The last item in the channel was not a text message or a message with a caption and cannot be reposted.',
+                details: 'This can happen with stickers, polls, or other non-text content.'
+            });
+        }
 
         // 3. Post the extracted message text back to the channel
         const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -60,9 +72,10 @@ export default async function handler(req, res) {
             },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
-                text: messageTextToRepost,
-                // Preserve markdown/html formatting if it exists
-                parse_mode: lastMessage.entities ? 'MarkdownV2' : undefined 
+                text: messageContent,
+                // If the original message had formatting, try to preserve it by setting parse_mode.
+                // Note: Telegram's MarkdownV2 is strict. If you have issues, you might switch to 'HTML'.
+                parse_mode: hasFormatting ? 'Markdown' : undefined
             })
         });
 
@@ -76,7 +89,7 @@ export default async function handler(req, res) {
         return res.status(200).json({
             success: true,
             message: 'Successfully fetched and reposted the last message.',
-            reposted_text: messageTextToRepost
+            reposted_text: messageContent
         });
 
     } catch (error) {
