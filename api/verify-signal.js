@@ -1,180 +1,222 @@
-import fetch from 'node-fetch';
+// evaluate.js
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
+// Use dotenv to load environment variables from .env file
+require('dotenv').config(); 
+// Use node-fetch for making API calls
+const fetch = require('node-fetch');
 
-// Enhanced with more robust error handling
-async function fetchWithRetry(url, options = {}, retries = 3) {
-    try {
-        const response = await fetch(url, options);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        return await response.json();
-    } catch (error) {
-        if (retries > 0) {
-            console.log(`Retrying... (${retries} attempts left)`);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            return fetchWithRetry(url, options, retries - 1);
-        }
-        throw error;
-    }
-}
+// --- Configuration ---
+const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, TWELVEDATA_API_KEY } = process.env;
 
-function parseTradeSignal(messageText) {
-    if (!messageText) return null;
+// --- Helper Functions ---
+
+/**
+ * Fetches the very last message from the specified Telegram channel.
+ * @returns {Promise<object|null>} The Telegram message object or null if none found.
+ */
+async function fetchLastSignalMessage() {
+    // The getUpdates method returns an array of updates.
+    // offset: -1 and limit: 1 is an efficient way to get only the last update.
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&limit=1&allowed_updates=["channel_post"]`;
     
     try {
-        const signalPattern = /📈 (.+?) Trade Signal \((.+?)\)[\s\S]+?⏰ Interval: (\d+)min[\s\S]+?💵 Price: ([\d.]+)[\s\S]+?🚦 Signal: (BUY|SELL|HOLD)/;
-        const match = messageText.match(signalPattern);
-        
-        if (!match) return null;
+        const response = await fetch(url);
+        const data = await response.json();
 
-        const timestampMatch = messageText.match(/🕒 (.+)$/);
-        const timestamp = timestampMatch ? new Date(timestampMatch[1]) : new Date();
-
-        return {
-            symbol: match[1],
-            strategy: match[2],
-            interval: parseInt(match[3]),
-            price: parseFloat(match[4]),
-            signal: match[5],
-            timestamp
-        };
-    } catch (error) {
-        console.error('Error parsing trade signal:', error);
-        return null;
-    }
-}
-
-async function determineSignalResult(signal) {
-    if (!signal) return null;
-    
-    try {
-        const startTime = Math.floor(signal.timestamp.getTime() / 1000);
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${signal.symbol}&interval=${signal.interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=2&start_date=${startTime}`;
-        
-        const data = await fetchWithRetry(timeSeriesUrl);
-        
-        if (data.status === 'error' || !data.values || data.values.length < 2) {
-            console.error('Insufficient data for analysis:', data);
+        if (!data.ok || data.result.length === 0) {
+            console.log('No new messages found.');
             return null;
         }
 
-        const nextCandle = data.values[1];
-        const nextClose = parseFloat(nextCandle.close);
-        const priceChange = ((nextClose - signal.price) / signal.price) * 100;
-
-        let result;
-        if (signal.signal === 'BUY') {
-            result = priceChange > 0 ? 'WIN' : 'LOSS';
-        } else if (signal.signal === 'SELL') {
-            result = priceChange < 0 ? 'WIN' : 'LOSS';
-        } else {
-            result = 'NEUTRAL';
+        // We only care about posts in our specific channel
+        const lastUpdate = data.result[0];
+        if (lastUpdate.channel_post && lastUpdate.channel_post.chat.id.toString() === TELEGRAM_CHANNEL_ID.toString()) {
+            return lastUpdate.channel_post;
         }
 
-        return {
-            result,
-            nextClose,
-            priceChange: priceChange.toFixed(2),
-            timestamp: new Date(nextCandle.datetime)
-        };
+        return null;
     } catch (error) {
-        console.error('Error determining signal result:', error);
+        console.error('Error fetching from Telegram:', error);
         return null;
     }
 }
 
-async function postResultToChannel(originalSignal, analysisResult) {
-    if (!originalSignal || !analysisResult) return false;
+/**
+ * Parses a signal message text to extract trade details using regex.
+ * @param {string} text The message content.
+ * @returns {object|null} An object with signal details or null if parsing fails.
+ */
+function parseSignalMessage(text) {
+    // This regex uses named capture groups to easily extract data.
+    const signalRegex = /Strategy: (?<strategy>[\w_]+)\s*Interval: (?<interval>\w+)\s*.*Signal: (?<signal>BUY|SELL)\s*Price: (?<price>[\d\.]+)\s*Symbol: (?<symbol>[\w\/]+)\s*.*_*(?<timestampStr>.*)_/s;
+
+    const match = text.match(signalRegex);
+
+    if (!match) {
+        return null;
+    }
+    
+    // Check if this message is a result message, which we should ignore.
+    if (text.includes('Outcome:')) {
+        console.log('Last message was a result post. Skipping.');
+        return null;
+    }
+
+    const { symbol, signal, price, interval, timestampStr } = match.groups;
+
+    return {
+        symbol,
+        signal, // 'BUY' or 'SELL'
+        entryPrice: parseFloat(price),
+        interval, // e.g., '5min', '1h'
+        signalTimestamp: new Date(timestampStr.trim()),
+    };
+}
+
+
+/**
+ * Fetches the closing price of the candle immediately following the signal.
+ * @param {object} signalData The parsed signal data.
+ * @returns {Promise<number|null>} The closing price or null on failure.
+ */
+async function getNextCandleClosePrice({ symbol, interval, signalTimestamp }) {
+    // Calculate the start time of the *next* candle
+    const intervalValue = parseInt(interval);
+    const intervalUnit = interval.replace(/[0-9]/g, '');
+
+    let intervalMs;
+    if (intervalUnit === 'min') {
+        intervalMs = intervalValue * 60 * 1000;
+    } else if (intervalUnit === 'h') {
+        intervalMs = intervalValue * 60 * 60 * 1000;
+    } else {
+        console.error('Unsupported interval unit:', intervalUnit);
+        return null;
+    }
+
+    // Round down the signal time to the start of its own candle, then add one interval.
+    const signalCandleStartMs = Math.floor(signalTimestamp.getTime() / intervalMs) * intervalMs;
+    const nextCandleStartTime = new Date(signalCandleStartMs + intervalMs);
+
+    // Format for TwelveData API (YYYY-MM-DD HH:mm:ss)
+    const startDate = nextCandleStartTime.toISOString().slice(0, 19).replace('T', ' ');
+
+    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&apikey=${TWELVEDATA_API_KEY}&start_date=${startDate}&outputsize=1`;
     
     try {
-        const resultEmoji = analysisResult.result === 'WIN' ? '✅' : analysisResult.result === 'LOSS' ? '❌' : '➖';
-        const directionEmoji = originalSignal.signal === 'BUY' ? '📈' : '📉';
-        
-        const message = `🔍 Trade Signal Analysis ${resultEmoji}
-${directionEmoji} ${originalSignal.symbol} ${originalSignal.signal} 
-⏰ Interval: ${originalSignal.interval}min
-🕒 Signal Time: ${originalSignal.timestamp.toLocaleString()}
-💵 Entry Price: ${originalSignal.price.toFixed(5)}
-💰 Exit Price: ${analysisResult.nextClose.toFixed(5)}
-📊 P/L: ${analysisResult.priceChange}%
-🎯 Result: ${analysisResult.result}`;
+        const response = await fetch(url);
+        const data = await response.json();
 
-        const response = await fetchWithRetry(
-            `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: CHANNEL_ID,
-                    text: message,
-                    parse_mode: 'Markdown',
-                    reply_to_message_id: originalSignal.messageId
-                })
+        if (data.status === 'error' || !data.values || data.values.length === 0) {
+            // It might be too soon for the next candle to have formed.
+            if(data.code === 400 && data.message.includes('future')) {
+                console.log('Next candle has not formed yet. Try again later.');
+            } else {
+                console.error('TwelveData Error fetching next candle:', data.message || 'No data returned');
             }
-        );
+            return null;
+        }
 
-        return true;
+        return parseFloat(data.values[0].close);
     } catch (error) {
-        console.error('Error posting to Telegram:', error);
-        return false;
+        console.error('Error fetching from TwelveData:', error);
+        return null;
     }
 }
 
-export default async function handler(req, res) {
-    // Immediate response to prevent timeout
-    res.setHeader('Content-Type', 'application/json');
-    
+
+/**
+ * Posts the result of the trade evaluation back to the channel.
+ * @param {object} resultData The data to include in the result message.
+ */
+async function postResultToChannel({ symbol, signal, entryPrice, closePrice, result, pnl }) {
+    const resultIcon = result === 'WIN' ? '✅' : '❌';
+    const pnlString = pnl.toFixed(5);
+    const message = `
+*--- Trade Result ---*
+${resultIcon} *Outcome: ${result}*
+
+*Symbol:* ${symbol}
+*Signal:* ${signal}
+*Entry Price:* ${entryPrice.toFixed(5)}
+*Close Price:* ${closePrice.toFixed(5)}
+*P/L:* ${pnlString}
+
+_Evaluation of signal from previous message._
+    `;
+
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const body = JSON.stringify({
+        chat_id: TELEGRAM_CHANNEL_ID,
+        text: message,
+        parse_mode: 'Markdown',
+    });
+
     try {
-        if (!BOT_TOKEN || !CHANNEL_ID) {
-            throw new Error('Missing Telegram configuration');
-        }
-
-        // 1. Fetch the last message
-        const messagesData = await fetchWithRetry(
-            `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`
-        );
-
-        if (!messagesData.ok || !messagesData.result?.length) {
-            return res.status(200).json({ status: 'No messages found' });
-        }
-
-        const lastMessage = messagesData.result[0];
-        if (!lastMessage.text) {
-            return res.status(200).json({ status: 'Last message has no text' });
-        }
-
-        // 2. Parse the trade signal
-        const signal = parseTradeSignal(lastMessage.text);
-        if (!signal) {
-            return res.status(200).json({ status: 'No trade signal detected' });
-        }
-        signal.messageId = lastMessage.message_id;
-
-        // 3. Determine the signal's result
-        const result = await determineSignalResult(signal);
-        if (!result) {
-            return res.status(200).json({ status: 'Could not analyze signal' });
-        }
-
-        // 4. Post the result back
-        await postResultToChannel(signal, result);
-
-        return res.status(200).json({
-            status: 'success',
-            symbol: signal.symbol,
-            signal: signal.signal,
-            result: result.result,
-            priceChange: result.priceChange
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
         });
-
+        const data = await response.json();
+        if (data.ok) {
+            console.log('Result successfully posted to Telegram.');
+        } else {
+            console.error('Failed to post to Telegram:', data.description);
+        }
     } catch (error) {
-        console.error('Fatal error:', error);
-        return res.status(500).json({ 
-            status: 'error',
-            error: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-        });
+        console.error('Error posting result to Telegram:', error);
     }
 }
+
+// --- Main Execution Logic ---
+async function run() {
+    console.log('Starting trade evaluation...');
+
+    // 1. Fetch the last message
+    const lastMessage = await fetchLastSignalMessage();
+    if (!lastMessage || !lastMessage.text) {
+        console.log('No valid message found to evaluate. Exiting.');
+        return;
+    }
+
+    // 2. Parse the message to get signal details
+    const signalData = parseSignalMessage(lastMessage.text);
+    if (!signalData) {
+        console.log('Last message was not a new trade signal. Exiting.');
+        return;
+    }
+    console.log('Found a trade signal to evaluate:', signalData);
+
+    // 3. Get the closing price of the next candle
+    const closePrice = await getNextCandleClosePrice(signalData);
+    if (closePrice === null) {
+        console.log('Could not determine closing price. Exiting.');
+        return;
+    }
+
+    // 4. Determine the result
+    let result = '';
+    const pnl = (signalData.signal === 'BUY') ? (closePrice - signalData.entryPrice) : (signalData.entryPrice - closePrice);
+
+    if (pnl > 0) {
+        result = 'WIN';
+    } else {
+        result = 'LOSS';
+    }
+
+    console.log(`Result: ${result}. Entry: ${signalData.entryPrice}, Close: ${closePrice}, P/L: ${pnl}`);
+
+    // 5. Post the result back to the channel
+    await postResultToChannel({
+        ...signalData,
+        closePrice,
+        result,
+        pnl,
+    });
+
+    console.log('Evaluation complete.');
+}
+
+// Run the script
+run();
