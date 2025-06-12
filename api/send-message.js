@@ -1,3 +1,19 @@
+import { initializeApp } from 'firebase/app';
+import { getFirestore, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+
+// Initialize Firebase (you'll need to configure this with your Firebase project settings)
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.FIREBASE_APP_ID
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
@@ -21,7 +37,7 @@ export default async function handler(req, res) {
 
         // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
         const twelveDataSymbol = symbol.includes('/') 
-            ? `${symbol.replace('/', '/')}` // Keep as EUR/USD for forex
+            ? `${symbol.replace('/', '/')}`
             : symbol;
 
         // 1. Get time series data for price change calculation
@@ -136,7 +152,27 @@ export default async function handler(req, res) {
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        // Format message
+        // Prepare the trade signal data
+        const tradeSignalData = {
+            symbol,
+            interval: parseInt(interval),
+            strategy,
+            price: currentClose,
+            ema21: currentEma21,
+            stochK: currentK,
+            stochD: currentD,
+            signal,
+            reason,
+            timestamp: serverTimestamp(),
+            sentToTelegram: false,
+            createdAt: new Date().toISOString()
+        };
+
+        // Save to Firestore first
+        const docRef = await addDoc(collection(db, 'tradeSignals'), tradeSignalData);
+        console.log('Document written with ID: ', docRef.id);
+
+        // Format message for Telegram
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
 💵 Price: ${currentClose.toFixed(5)}
@@ -147,6 +183,7 @@ export default async function handler(req, res) {
 
 🕒 ${new Date().toLocaleString()}`;
 
+        // Send to Telegram
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -162,6 +199,12 @@ export default async function handler(req, res) {
             throw new Error(error.description || 'Telegram API error');
         }
 
+        // Update the Firestore document to mark as sent to Telegram
+        await updateDoc(docRef, {
+            sentToTelegram: true,
+            telegramSentAt: serverTimestamp()
+        });
+
         return res.status(200).json({ 
             success: true,
             symbol,
@@ -172,7 +215,8 @@ export default async function handler(req, res) {
             stochK: currentK,
             stochD: currentD,
             signal,
-            reason
+            reason,
+            firestoreId: docRef.id
         });
 
     } catch (error) {
