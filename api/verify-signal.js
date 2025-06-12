@@ -3,13 +3,11 @@
  * and post it back to the same channel.
  *
  * This function is useful for "bumping" or reposting important announcements.
- * It's designed to be triggered by a cron job or a manual request.
  *
- * VERSION 2: Now correctly handles both standard text messages and media (photos/videos)
- * with captions.
+ * VERSION 3: Now correctly handles EDITED messages in addition to new messages
+ * and media with captions. It's more robust against different types of channel updates.
  */
 export default async function handler(req, res) {
-    // Allow both GET (for easy browser testing) and POST (semantically correct)
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
@@ -24,7 +22,7 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 1. Fetch the last message from the channel
+        // 1. Fetch the last update from the channel
         const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&offset=-1`;
 
         const updatesResponse = await fetch(getUpdatesUrl);
@@ -39,22 +37,30 @@ export default async function handler(req, res) {
         }
 
         const lastUpdate = updatesData.result[0];
-        const lastMessage = lastUpdate.channel_post || lastUpdate.message;
 
-        if (!lastMessage) {
-            return res.status(404).json({ error: 'Could not identify a valid message in the last update.' });
-        }
+        // For debugging: This will show you exactly what the last update object looks like.
+        console.log('Received last update from Telegram:', JSON.stringify(lastUpdate, null, 2));
 
         // 2. *** THE FIX IS HERE ***
-        // Extract the text content, whether it's in the 'text' field (for normal messages)
-        // or the 'caption' field (for media messages).
+        // Identify the message object, whether it's new or edited.
+        const lastMessage = lastUpdate.channel_post ||         // A new post in the channel
+                            lastUpdate.edited_channel_post ||   // An edited post in the channel
+                            lastUpdate.message ||               // A new message (fallback)
+                            lastUpdate.edited_message;          // An edited message (fallback)
+
+        // If none of the above fields exist, the update was something else (e.g., bot permissions changed).
+        if (!lastMessage) {
+            return res.status(404).json({
+                error: 'Could not identify a valid message in the last update.',
+                details: 'The last update was not a new or edited message.'
+            });
+        }
+
+        // 3. Extract the text content, whether it's from 'text' or 'caption'.
         const messageContent = lastMessage.text || lastMessage.caption;
         
-        // Determine if the original message had formatting (like bold, italic, etc.)
-        // For text messages, entities are in `entities`. For captions, they are in `caption_entities`.
         const hasFormatting = lastMessage.entities || lastMessage.caption_entities;
 
-        // If after checking both text and caption, we still have nothing, then it's a non-text message (e.g., a sticker).
         if (!messageContent) {
             return res.status(404).json({
                 error: 'The last item in the channel was not a text message or a message with a caption and cannot be reposted.',
@@ -62,19 +68,15 @@ export default async function handler(req, res) {
             });
         }
 
-        // 3. Post the extracted message text back to the channel
+        // 4. Post the extracted message text back to the channel
         const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
         
         const repostResponse = await fetch(sendMessageUrl, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: messageContent,
-                // If the original message had formatting, try to preserve it by setting parse_mode.
-                // Note: Telegram's MarkdownV2 is strict. If you have issues, you might switch to 'HTML'.
                 parse_mode: hasFormatting ? 'Markdown' : undefined
             })
         });
@@ -85,7 +87,7 @@ export default async function handler(req, res) {
             throw new Error(`Failed to repost message: ${errorDetails.description}`);
         }
 
-        // 4. Return a success response
+        // 5. Return a success response
         return res.status(200).json({
             success: true,
             message: 'Successfully fetched and reposted the last message.',
