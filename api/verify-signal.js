@@ -10,75 +10,135 @@ export default async function handler(req, res) {
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
-        return res.status(500).json({ error: 'Missing Telegram configuration' });
+        return res.status(500).json({ 
+            error: 'Missing Telegram configuration',
+            details: {
+                BOT_TOKEN: BOT_TOKEN ? '*****' : 'MISSING',
+                CHANNEL_ID: CHANNEL_ID ? '*****' : 'MISSING'
+            }
+        });
     }
 
     try {
-        // 1. Fetch the last message from the channel
-        // First try getting the last channel post directly
-        const getHistoryUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`;
-        const historyResponse = await fetch(getHistoryUrl);
-        const historyData = await historyResponse.json();
+        // First try to get basic chat information to verify access
+        const getChatUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${CHANNEL_ID}`;
+        const chatResponse = await fetch(getChatUrl);
+        const chatData = await chatResponse.json();
 
-        let lastMessage = null;
-
-        // Check if we got a message from getChatHistory
-        if (historyData.ok && historyData.result && historyData.result.messages && historyData.result.messages.length > 0) {
-            const messageObj = historyData.result.messages[0];
-            lastMessage = messageObj.text || messageObj.caption || null;
+        if (!chatData.ok) {
+            return res.status(404).json({
+                error: 'Cannot access chat/channel',
+                details: {
+                    telegram_error: chatData.description,
+                    chat_id_format: typeof CHANNEL_ID === 'string' ? 
+                        (CHANNEL_ID.startsWith('@') ? 'public channel' : 
+                         CHANNEL_ID.startsWith('-100') ? 'private channel/supergroup' : 
+                         'unknown format (should start with @ or -100)') : 'invalid type',
+                    troubleshooting: [
+                        'Ensure bot is added to the channel as admin',
+                        'For private channels, use ID in format "-100123456789"',
+                        'For public channels, use username in format "@channelname"'
+                    ]
+                }
+            });
         }
 
-        // If not found, try getUpdates as fallback
-        if (!lastMessage) {
-            const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=1`;
-            const updatesResponse = await fetch(getUpdatesUrl);
-            const updatesData = await updatesResponse.json();
+        // Try to get the last message through different methods
+        let lastMessage = null;
+        let methodUsed = '';
+        
+        // Method 1: getChatHistory (works for channels where bot is admin)
+        try {
+            const historyUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`;
+            const historyResponse = await fetch(historyUrl);
+            const historyData = await historyResponse.json();
 
-            if (updatesData.ok && updatesData.result && updatesData.result.length > 0) {
-                const update = updatesData.result[0];
-                // Check different message locations in the update object
-                if (update.message) {
-                    lastMessage = update.message.text || update.message.caption || null;
-                } else if (update.channel_post) {
-                    lastMessage = update.channel_post.text || update.channel_post.caption || null;
-                } else if (update.edited_message) {
-                    lastMessage = update.edited_message.text || update.edited_message.caption || null;
+            if (historyData.ok && historyData.result?.messages?.length > 0) {
+                const message = historyData.result.messages[0];
+                lastMessage = message.text || message.caption || null;
+                methodUsed = 'getChatHistory';
+            }
+        } catch (e) {
+            console.log('getChatHistory failed, trying fallback methods');
+        }
+
+        // Method 2: getUpdates (works if bot has seen recent messages)
+        if (!lastMessage) {
+            try {
+                const updatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=10`;
+                const updatesResponse = await fetch(updatesUrl);
+                const updatesData = await updatesResponse.json();
+
+                if (updatesData.ok && updatesData.result?.length > 0) {
+                    // Find the most recent message from our channel
+                    for (const update of updatesData.result.reverse()) {
+                        const message = update.message || update.channel_post || update.edited_message;
+                        if (message && (message.chat?.id == CHANNEL_ID || message.chat?.username === CHANNEL_ID.replace('@', ''))) {
+                            lastMessage = message.text || message.caption || null;
+                            methodUsed = 'getUpdates';
+                            break;
+                        }
+                    }
                 }
+            } catch (e) {
+                console.log('getUpdates failed');
             }
         }
 
         if (!lastMessage) {
-            return res.status(404).json({ error: 'No text message found in the channel' });
+            return res.status(404).json({
+                error: 'No message found',
+                details: {
+                    troubleshooting: [
+                        'Bot might not have message history access',
+                        'Try sending a new message to the channel with the bot as admin',
+                        'For channels, use getChatHistory method (bot needs admin rights)',
+                        'Make sure channel ID is correct'
+                    ],
+                    verified_chat_info: chatData.result
+                }
+            });
         }
 
-        // 2. Post the same message back to the channel
+        // Post the message back
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
-                text: `🔁 Reposting last message:\n\n${lastMessage}`,
-                parse_mode: 'HTML' // Using HTML to preserve emojis and formatting
+                text: `🔁 Reposting last message (via ${methodUsed}):\n\n${lastMessage}`,
+                parse_mode: 'HTML'
             })
         });
 
+        const responseData = await telegramResponse.json();
+        
         if (!telegramResponse.ok) {
-            const error = await telegramResponse.json();
-            throw new Error(error.description || 'Telegram API error');
+            return res.status(500).json({
+                error: 'Failed to repost message',
+                telegram_error: responseData.description,
+                details: {
+                    method_used: methodUsed,
+                    original_message: lastMessage,
+                    chat_id_used: CHANNEL_ID
+                }
+            });
         }
 
         return res.status(200).json({ 
             success: true,
-            originalMessage: lastMessage,
-            reposted: true,
-            note: 'Emojis and formatting should be preserved'
+            method_used: methodUsed,
+            original_message: lastMessage,
+            reposted_message: responseData.result,
+            chat_info: chatData.result
         });
 
     } catch (error) {
         console.error('Error:', error);
         return res.status(500).json({ 
             error: 'Internal Server Error',
-            details: error.message 
+            details: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
 }
