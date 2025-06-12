@@ -1,144 +1,193 @@
-// File: check-signal-result.js
+import { URLSearchParams } from 'url';
+
+// --- Helper Functions ---
+
+/**
+ * Parses a signal message text to extract trade details.
+ * @param {string} text - The text content of the Telegram message.
+ * @returns {object|null} An object with signal details or null if not a valid signal message.
+ */
+function parseSignalMessage(text) {
+    // Regex to capture the necessary details from the message format of the first script.
+    const signalRegex = /^\*📈\s(.+?)\sTrade Signal.*?\*⏰ Interval:\* (\d+)min.*?💵 Price:\* ([\d.]+).*?🚦 Signal: (BUY|SELL)\*.*?_🕒 (.*?)_$/ms;
+    
+    const match = text.match(signalRegex);
+
+    if (!match) {
+        return null;
+    }
+
+    return {
+        symbol: match[1].trim(),
+        interval: parseInt(match[2], 10),
+        price: parseFloat(match[3]),
+        signalType: match[4],
+        timestamp: new Date(match[5]),
+    };
+}
+
+/**
+ * Escapes characters for Telegram's MarkdownV2 format.
+ * @param {string} text - The text to escape.
+ * @returns {string} - The escaped text.
+ */
+function escapeMarkdownV2(text) {
+    // Characters to escape for MarkdownV2
+    const charsToEscape = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let escapedText = text;
+    for (const char of charsToEscape) {
+        escapedText = escapedText.replace(new RegExp('\\' + char, 'g'), '\\' + char);
+    }
+    return escapedText;
+}
+
+
+// --- API Handler ---
+
 export default async function handler(req, res) {
+    // 1. Request Method Validation
     if (req.method !== 'POST') {
         res.setHeader('Allow', ['POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
-    const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
+    // 2. Configuration & Secrets
+    const { 
+        TELEGRAM_BOT_TOKEN: BOT_TOKEN, 
+        TELEGRAM_CHANNEL_ID: CHANNEL_ID, 
+        TWELVEDATA_API_KEY 
+    } = process.env;
 
-    if (!BOT_TOKEN || !CHANNEL_ID) {
-        return res.status(500).json({ error: 'Missing Telegram configuration' });
+    if (!BOT_TOKEN || !CHANNEL_ID || !TWELVEDATA_API_KEY) {
+        console.error('Missing one or more required environment variables.');
+        return res.status(500).json({ error: 'Server configuration error.' });
     }
 
     try {
-        // 1. Fetch last message from Telegram channel
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1`;
+        // 3. Fetch Recent Channel Messages
+        // We get the last 20 messages to find the latest signal and check for existing replies.
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=20`;
         const updatesResponse = await fetch(getUpdatesUrl);
         const updatesData = await updatesResponse.json();
 
-        if (!updatesResponse.ok || !updatesData.result || updatesData.result.length === 0) {
-            return res.status(404).json({ error: 'No messages found in channel' });
+        if (!updatesData.ok || !updatesData.result) {
+            throw new Error('Failed to fetch messages from Telegram.');
         }
 
-        const lastMessage = updatesData.result[0].channel_post;
-        const messageText = lastMessage.text;
-        const messageDate = new Date(lastMessage.date * 1000);
+        const posts = updatesData.result
+            .filter(u => u.channel_post) // Ensure we only look at channel posts
+            .map(u => u.channel_post)
+            .reverse(); // Newest first
 
-        // 2. Identify trade signals in the message
-        const signalRegex = /📈 (.+?) Trade Signal \((.+?)\)\n⏰ Interval: (.+?)min\n💵 Price: (.+?)\n📊 EMA21: (.+?)\n📉 Stoch K\/D: (.+?)\n🚦 Signal: (.+?)\n💡 Reason: (.+?)\n\n🕒 (.+)/;
-        const match = messageText.match(signalRegex);
+        // 4. Find Latest Signal Message and Check for Existing Reply
+        let latestSignalPost = null;
+        for (const post of posts) {
+            if (post.text && parseSignalMessage(post.text)) {
+                latestSignalPost = post;
+                break; // Found the most recent signal
+            }
+        }
 
-        if (!match) {
+        if (!latestSignalPost) {
+            return res.status(200).json({ success: true, message: 'No new signal message found to analyze.' });
+        }
+
+        // Check if this signal has already been replied to by our bot
+        const hasBeenRepliedTo = posts.some(
+            post => post.reply_to_message && post.reply_to_message.message_id === latestSignalPost.message_id
+        );
+
+        if (hasBeenRepliedTo) {
+            return res.status(200).json({ success: true, message: `Signal from message ${latestSignalPost.message_id} has already been analyzed.` });
+        }
+        
+        // 5. Parse Signal and Check if Result is Ready
+        const signalDetails = parseSignalMessage(latestSignalPost.text);
+        
+        // Calculate when the result candle should have closed
+        const resultTime = new Date(signalDetails.timestamp.getTime() + signalDetails.interval * 60 * 1000);
+
+        if (new Date() < resultTime) {
             return res.status(200).json({ 
-                success: true, 
-                message: 'Last message is not a trade signal', 
-                lastMessage: messageText 
+                success: false, 
+                message: 'Result not yet available. Waiting for the next candle to close.',
+                willBeReadyAt: resultTime.toISOString()
             });
         }
+        
+        // 6. Fetch Price Data for the Result Candle
+        const params = new URLSearchParams({
+            symbol: signalDetails.symbol,
+            interval: `${signalDetails.interval}min`,
+            start_date: resultTime.toISOString().split('T')[0], // Get data for the day
+            apikey: TWELVEDATA_API_KEY,
+            outputsize: 5 // Get a few candles to be safe
+        });
+        const timeSeriesUrl = `https://api.twelvedata.com/time_series?${params.toString()}`;
+        const priceResponse = await fetch(timeSeriesUrl);
+        const priceData = await priceResponse.json();
 
-        const [, symbol, strategy, interval, price, ema21, stochKD, signal, reason, timestamp] = match;
-        const stochK = parseFloat(stochKD.split('/')[0]);
-        const stochD = parseFloat(stochKD.split('/')[1]);
-        const entryPrice = parseFloat(price);
-
-        // 3. Determine signal's result based on next candle close price
-        // Calculate the time of the next candle close
-        const intervalMinutes = parseInt(interval);
-        const nextCandleCloseTime = new Date(messageDate);
-        nextCandleCloseTime.setMinutes(nextCandleCloseTime.getMinutes() + intervalMinutes);
-
-        // Check if enough time has passed to evaluate the signal
-        const currentTime = new Date();
-        if (currentTime < nextCandleCloseTime) {
-            return res.status(200).json({ 
-                success: true, 
-                message: 'Signal evaluation time not reached yet', 
-                nextEvaluationTime: nextCandleCloseTime.toISOString() 
-            });
+        if (priceData.status === 'error' || !priceData.values) {
+            throw new Error(`Failed to fetch price data from TwelveData: ${priceData.message || 'Unknown error'}`);
         }
 
-        // Fetch price data for the evaluation period
-        const twelveDataSymbol = symbol.includes('/') ? symbol : symbol;
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&start_date=${messageDate.toISOString()}&end_date=${currentTime.toISOString()}`;
-        const timeSeriesResponse = await fetch(timeSeriesUrl);
-        const timeSeriesData = await timeSeriesResponse.json();
+        // Find the specific candle that corresponds to our result time
+        const resultCandle = priceData.values.find(v => new Date(v.datetime).getTime() === resultTime.getTime());
 
-        if (timeSeriesData.status === 'error' || !timeSeriesData.values || timeSeriesData.values.length < 2) {
-            console.error('TwelveData Error:', timeSeriesData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch evaluation data',
-                details: timeSeriesData.message || 'Not enough data points'
-            });
+        if (!resultCandle) {
+             throw new Error(`Could not find the result candle for timestamp ${resultTime.toISOString()}`);
         }
 
-        // The first value is the candle when the signal was generated
-        // The second value is the next candle we want to evaluate
-        const evaluationCandle = timeSeriesData.values[1];
-        const exitPrice = parseFloat(evaluationCandle.close);
-        const priceChange = ((exitPrice - entryPrice) / entryPrice) * 100;
+        const resultClosePrice = parseFloat(resultCandle.close);
 
-        // Determine if the signal was successful
-        let result, resultMessage;
-        if (signal === 'BUY') {
-            const isWin = exitPrice > entryPrice;
-            result = isWin ? 'WIN' : 'LOSS';
-            resultMessage = `BUY signal ${isWin ? 'won' : 'lost'} (${priceChange.toFixed(2)}%)`;
-        } else if (signal === 'SELL') {
-            const isWin = exitPrice < entryPrice;
-            result = isWin ? 'WIN' : 'LOSS';
-            resultMessage = `SELL signal ${isWin ? 'won' : 'lost'} (${priceChange.toFixed(2)}%)`;
-        } else {
-            result = 'HOLD';
-            resultMessage = 'No trade signal to evaluate';
+        // 7. Determine Signal Result (WIN/LOSS)
+        const pnl = resultClosePrice - signalDetails.price;
+        let outcome;
+        
+        if (signalDetails.signalType === 'BUY') {
+            outcome = pnl > 0 ? "WIN ✅" : "LOSS ❌";
+        } else { // SELL
+            outcome = pnl < 0 ? "WIN ✅" : "LOSS ❌";
         }
 
-        // 4. Post the result back to the channel
-        const resultMessageText = `📊 ${symbol} Trade Result (${strategy})
-⏰ Interval: ${interval}min
-⏱️ Signal Time: ${messageDate.toLocaleString()}
-📊 Evaluation Time: ${new Date(evaluationCandle.datetime).toLocaleString()}
-💰 Entry Price: ${entryPrice.toFixed(5)}
-📈 Exit Price: ${exitPrice.toFixed(5)}
-📉 Price Change: ${priceChange.toFixed(2)}%
-🏆 Result: ${result}
-📝 Details: ${resultMessage}
+        // 8. Post Result Back to Telegram as a Reply
+        const pnlPoints = (pnl).toFixed(5); // Format for clarity
+        const resultMessageText = `*🎯 Signal Result*
 
-🔍 Original Signal:
-${signal} - ${reason}`;
+*Outcome:* ${outcome}
+*Result Price:* ${escapeMarkdownV2(resultClosePrice.toFixed(5))}
+*P/L:* ${escapeMarkdownV2(pnlPoints)} points`;
 
-        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+        const telegramResponse = await fetch(sendMessageUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: resultMessageText,
-                parse_mode: 'Markdown',
-                reply_to_message_id: lastMessage.message_id
+                parse_mode: 'MarkdownV2',
+                reply_to_message_id: latestSignalPost.message_id
             })
         });
 
         if (!telegramResponse.ok) {
             const error = await telegramResponse.json();
-            throw new Error(error.description || 'Telegram API error');
+            throw new Error(`Telegram API Error: ${error.description}`);
         }
 
-        return res.status(200).json({ 
+        return res.status(200).json({
             success: true,
-            symbol,
-            strategy,
-            interval,
-            entryPrice,
-            exitPrice,
-            priceChange,
-            result,
-            resultMessage
+            message: 'Successfully analyzed signal and posted result.',
+            analysis: {
+                ...signalDetails,
+                result: outcome,
+                resultPrice: resultClosePrice,
+                pnl: pnlPoints
+            }
         });
 
     } catch (error) {
-        console.error('Error:', error);
+        console.error('Error in analyze-signal-result handler:', error);
         return res.status(500).json({ 
             error: 'Internal Server Error',
             details: error.message 
