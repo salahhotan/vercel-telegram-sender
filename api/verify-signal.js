@@ -12,15 +12,18 @@ export default async function handler(req, res) {
     }
 
     try {
-        // --- STEP 1: Fetch the last message from the Telegram channel ---
+        // --- STEP 1: Fetch the last message using the most robust method ---
 
-        // Improved URL:
-        // - `allowed_updates=["channel_post"]`: This is the key change. We explicitly tell Telegram
-        //   to only send us updates about new messages in the channel, ignoring everything else.
-        // - `limit=1`: Get only the most recent one.
-        const allowedUpdates = encodeURIComponent(JSON.stringify(["channel_post"]));
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&allowed_updates=${allowedUpdates}`;
-        
+        // The most reliable way to get the single latest update is with `offset: -1`.
+        // We also now ask for all types of message/post events.
+        const allowedUpdates = encodeURIComponent(JSON.stringify([
+            "message", 
+            "edited_message", 
+            "channel_post", 
+            "edited_channel_post"
+        ]));
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&offset=-1&allowed_updates=${allowedUpdates}`;
+
         const updatesResponse = await fetch(getUpdatesUrl);
         const updatesData = await updatesResponse.json();
 
@@ -30,54 +33,55 @@ export default async function handler(req, res) {
         }
 
         if (!updatesData.result || updatesData.result.length === 0) {
-            return res.status(404).json({ 
-                success: false, 
-                message: 'No recent channel messages found to repost.' 
+            return res.status(404).json({
+                success: false,
+                message: 'No recent messages or posts found to repost.'
             });
         }
 
-        const lastUpdate = updatesData.result[updatesData.result.length - 1];
-        const post = lastUpdate.channel_post;
+        // With offset=-1 and limit=1, the result will be an array with one item.
+        const lastUpdate = updatesData.result[0];
 
-        // A post might not exist if the update is malformed (highly unlikely with allowed_updates)
+        // --- THIS IS THE KEY FIX ---
+        // Intelligently find the message object, whether it's a new post, an edited post,
+        // a group message, or an edited group message.
+        const post = lastUpdate.channel_post || lastUpdate.edited_channel_post || lastUpdate.message || lastUpdate.edited_message;
+
+        // For debugging: If it still fails, this will show you exactly what Telegram sent.
+        // You can check this in your Vercel logs.
         if (!post) {
-            return res.status(404).json({ 
-                success: false, 
-                message: 'Could not find a valid channel post in the last update.' 
+            console.log('DEBUG: Full last update object received from Telegram:', JSON.stringify(lastUpdate, null, 2));
+            return res.status(404).json({
+                success: false,
+                message: 'Could not find a recognizable message or post object in the last update.'
             });
         }
 
-        // Improved text extraction:
-        // A message's content can be in '.text' (for a standard text message)
-        // or in '.caption' (for a photo, video, or document with a caption).
-        // This line checks for text first, and if it's not there, checks for a caption.
+        // The rest of the logic is the same, but now it operates on the correct `post` object.
         const messageToRepost = post.text || post.caption;
 
         if (!messageToRepost) {
-             return res.status(400).json({ 
-                success: false, 
-                message: 'The latest channel post was not a text message or did not have a caption, and cannot be reposted.' 
+            return res.status(400).json({
+                success: false,
+                message: 'The latest post/message was not text or did not have a caption.'
             });
         }
 
         const originalMessageId = post.message_id;
 
         // --- STEP 2: Post the message back to the channel ---
-
         const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        
+
         const repostResponse = await fetch(sendMessageUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: messageToRepost,
-                // Add parse_mode to preserve formatting like bold, italics, etc.
-                // from the original message.
                 parse_mode: 'Markdown'
             }),
         });
-        
+
         if (!repostResponse.ok) {
             const errorData = await repostResponse.json();
             console.error('Telegram API Error (sendMessage):', errorData);
