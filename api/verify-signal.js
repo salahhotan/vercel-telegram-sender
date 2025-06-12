@@ -1,3 +1,5 @@
+// pages/api/repost-last-message.js
+
 export default async function handler(req, res) {
     if (req.method !== 'GET') {
         res.setHeader('Allow', ['GET']);
@@ -5,24 +7,25 @@ export default async function handler(req, res) {
     }
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // e.g., -1001234567890
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         return res.status(500).json({ error: 'Missing Telegram configuration environment variables.' });
     }
 
     try {
-        // --- STEP 1: Fetch the last message using the most robust method ---
+        // --- STEP 1: Fetch the last update for the BOT ---
 
-        // The most reliable way to get the single latest update is with `offset: -1`.
-        // We also now ask for all types of message/post events.
+        // The most reliable way to get the single latest update is `offset: -1`.
+        // We REMOVE `chat_id` because getUpdates doesn't use it.
+        // We add `allowed_updates` as a best practice to only get message-related events.
         const allowedUpdates = encodeURIComponent(JSON.stringify([
             "message", 
             "edited_message", 
             "channel_post", 
             "edited_channel_post"
         ]));
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&offset=-1&allowed_updates=${allowedUpdates}`;
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=1&offset=-1&allowed_updates=${allowedUpdates}`;
 
         const updatesResponse = await fetch(getUpdatesUrl);
         const updatesData = await updatesResponse.json();
@@ -35,41 +38,51 @@ export default async function handler(req, res) {
         if (!updatesData.result || updatesData.result.length === 0) {
             return res.status(404).json({
                 success: false,
-                message: 'No recent messages or posts found to repost.'
+                message: 'No recent updates found for this bot.'
             });
         }
 
+        // --- STEP 2: Find the message object and VALIDATE its origin ---
+        
         // With offset=-1 and limit=1, the result will be an array with one item.
         const lastUpdate = updatesData.result[0];
 
-        // --- THIS IS THE KEY FIX ---
         // Intelligently find the message object, whether it's a new post, an edited post,
         // a group message, or an edited group message.
-        const post = lastUpdate.channel_post || lastUpdate.edited_channel_post || lastUpdate.message || lastUpdate.edited_message;
+        const message = lastUpdate.channel_post || lastUpdate.edited_channel_post || lastUpdate.message || lastUpdate.edited_message;
 
-        // For debugging: If it still fails, this will show you exactly what Telegram sent.
-        // You can check this in your Vercel logs.
-        if (!post) {
+        // If for some reason the last update was not a message type we handle (e.g., a poll).
+        if (!message) {
             console.log('DEBUG: Full last update object received from Telegram:', JSON.stringify(lastUpdate, null, 2));
             return res.status(404).json({
                 success: false,
-                message: 'Could not find a recognizable message or post object in the last update.'
+                message: 'The last update was not a recognizable message or post.'
+            });
+        }
+        
+        // **CRITICAL VALIDATION STEP:**
+        // Since getUpdates fetches from ALL chats, we must verify this message is from the channel we want.
+        // We compare the chat ID from the message with our environment variable.
+        if (message.chat.id.toString() !== CHANNEL_ID.toString()) {
+             return res.status(404).json({
+                success: false,
+                message: `Last message was from a different chat (ID: ${message.chat.id}) and not the target channel (ID: ${CHANNEL_ID}).`
             });
         }
 
-        // The rest of the logic is the same, but now it operates on the correct `post` object.
-        const messageToRepost = post.text || post.caption;
+        // --- STEP 3: Extract content and repost ---
+
+        const messageToRepost = message.text || message.caption;
 
         if (!messageToRepost) {
             return res.status(400).json({
                 success: false,
-                message: 'The latest post/message was not text or did not have a caption.'
+                message: 'The latest message in the target channel was not text or did not have a caption.'
             });
         }
 
-        const originalMessageId = post.message_id;
+        const originalMessageId = message.message_id;
 
-        // --- STEP 2: Post the message back to the channel ---
         const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 
         const repostResponse = await fetch(sendMessageUrl, {
@@ -78,7 +91,8 @@ export default async function handler(req, res) {
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: messageToRepost,
-                parse_mode: 'Markdown'
+                // You can add parse_mode if you expect Markdown or HTML
+                // parse_mode: 'Markdown' 
             }),
         });
 
