@@ -1,123 +1,94 @@
-// filename: get-last-message.js
-
 export default async function handler(req, res) {
+    // 1. Ensure the request method is GET
     if (req.method !== 'GET') {
         res.setHeader('Allow', ['GET']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
+    // 2. Load and validate environment variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = '-1002496807595'; // Using your channel's numeric ID
+    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
-    if (!BOT_TOKEN) {
-        return res.status(500).json({ 
-            error: 'Missing Telegram Bot Token',
-            details: 'Check your Vercel environment variables'
-        });
+    if (!BOT_TOKEN || !CHANNEL_ID) {
+        return res.status(500).json({ error: 'Missing Telegram configuration environment variables.' });
     }
 
     try {
-        // 1. Verify bot is admin in channel
-        const adminCheckUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${CHANNEL_ID}&user_id=${BOT_TOKEN.split(':')[0]}`;
-        const adminResponse = await fetch(adminCheckUrl);
-        const adminData = await adminResponse.json();
+        // --- STEP 1: Fetch the last message from the Telegram channel ---
 
-        if (!adminData.ok || !['administrator', 'creator'].includes(adminData.result?.status)) {
-            return res.status(403).json({
-                error: 'Bot is not an admin in the channel',
-                solution: {
-                    step1: 'Add @YourBotUsername as admin to @shnbat',
-                    step2: 'Enable "View Messages" and "Post Messages" permissions',
-                    step3: 'Try again after 1 minute',
-                    verification_link: `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${CHANNEL_ID}&user_id=${BOT_TOKEN.split(':')[0]}`
-                }
+        // The `getUpdates` method fetches recent updates. `limit=1` gets the very last one.
+        // We need to use a large negative offset to ensure we get the last update.
+        // A more reliable way is to just use limit=1 and take the last element of the result array.
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1`;
+        
+        const updatesResponse = await fetch(getUpdatesUrl);
+        const updatesData = await updatesResponse.json();
+
+        if (!updatesResponse.ok || !updatesData.ok) {
+            console.error('Telegram API Error (getUpdates):', updatesData);
+            throw new Error(updatesData.description || 'Failed to fetch updates from Telegram.');
+        }
+
+        if (!updatesData.result || updatesData.result.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'No messages found in the channel to repost.' 
             });
         }
 
-        // 2. Get the last message (using getChatHistory)
-        const historyUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`;
-        const historyResponse = await fetch(historyUrl);
-        const historyData = await historyResponse.json();
+        // The result is an array of updates. The last one is the most recent.
+        const lastUpdate = updatesData.result[updatesData.result.length - 1];
 
-        if (!historyData.ok || !historyData.result?.messages?.length) {
-            // If no messages found, try sending a test message
-            const testMsgResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: CHANNEL_ID,
-                    text: 'رسالة اختبار من البوت',
-                    parse_mode: 'HTML'
-                })
-            });
-
-            const testMsgData = await testMsgResponse.json();
-
-            if (!testMsgResponse.ok) {
-                return res.status(500).json({
-                    error: 'Failed to send test message',
-                    details: {
-                        telegram_error: testMsgData.description,
-                        required_permissions: 'The bot needs "Send Messages" permission',
-                        channel_info: {
-                            id: CHANNEL_ID,
-                            username: 'shnbat'
-                        }
-                    }
-                });
-            }
-
-            return res.status(404).json({
-                error: 'No previous messages found',
-                success: 'Test message sent successfully',
-                details: {
-                    test_message: testMsgData.result,
-                    note: 'Try the request again to fetch this test message'
-                }
+        // A channel message is identified by `channel_post`. We need to ensure it exists and has text.
+        if (!lastUpdate.channel_post || !lastUpdate.channel_post.text) {
+             return res.status(400).json({ 
+                success: false, 
+                message: 'The latest update was not a text message and cannot be reposted.' 
             });
         }
 
-        const lastMessage = historyData.result.messages[0].text || 
-                          historyData.result.messages[0].caption || 
-                          '[media message]';
+        const messageToRepost = lastUpdate.channel_post.text;
+        const originalMessageId = lastUpdate.channel_post.message_id;
 
-        // 3. Repost the message
-        const repostResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        // --- STEP 2: Post the message back to the channel ---
+
+        const sendMessageUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+        
+        const repostResponse = await fetch(sendMessageUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+            },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
-                text: `📢 آخر رسالة في القناة:\n\n${lastMessage}`,
-                parse_mode: 'HTML'
-            })
+                text: messageToRepost,
+                // Note: This simple repost does not preserve formatting (Markdown/HTML)
+                // from the original message. It just sends the raw text content.
+            }),
         });
+        
+        if (!repostResponse.ok) {
+            const errorData = await repostResponse.json();
+            console.error('Telegram API Error (sendMessage):', errorData);
+            throw new Error(errorData.description || 'Failed to repost message to Telegram.');
+        }
 
         const repostData = await repostResponse.json();
 
+        // 3. Return a success response
         return res.status(200).json({
             success: true,
-            action: 'last_message_reposted',
-            original_message: lastMessage,
-            reposted_message: repostData.result,
-            channel: {
-                id: CHANNEL_ID,
-                username: 'shnbat'
-            }
+            message: 'Successfully fetched and reposted the last message.',
+            reposted_content: messageToRepost,
+            original_message_id: originalMessageId,
+            new_message_id: repostData.result.message_id
         });
 
     } catch (error) {
-        console.error('Error:', error);
-        return res.status(500).json({ 
+        console.error('Repost Handler Error:', error);
+        return res.status(500).json({
             error: 'Internal Server Error',
-            details: {
-                message: error.message,
-                troubleshooting: [
-                    '1. Verify bot token is correct',
-                    '2. Ensure bot is admin in @shnbat',
-                    `3. Check bot permissions: https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${CHANNEL_ID}&user_id=${BOT_TOKEN.split(':')[0]}`,
-                    '4. Try sending a manual message first'
-                ]
-            }
+            details: error.message,
         });
     }
 }
