@@ -1,27 +1,3 @@
-import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, serverTimestamp, updateDoc, doc } from 'firebase/firestore';
-
-// Initialize Firebase
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID
-};
-
-// Initialize Firebase only if config values exist
-let db;
-if (firebaseConfig.apiKey) {
-  try {
-    const firebaseApp = initializeApp(firebaseConfig);
-    db = getFirestore(firebaseApp);
-  } catch (error) {
-    console.error('Firebase initialization error:', error);
-  }
-}
-
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
@@ -43,17 +19,16 @@ export default async function handler(req, res) {
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        // Normalize symbol for TwelveData API
+        // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
         const twelveDataSymbol = symbol.includes('/') 
-            ? symbol.replace('/', '/')
+            ? `${symbol.replace('/', '/')}` // Keep as EUR/USD for forex
             : symbol;
 
-        // 1. Get time series data
+        // 1. Get time series data for price change calculation
         const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
-        if (!timeSeriesResponse.ok) throw new Error('TwelveData API time series request failed');
-        
         const timeSeriesData = await timeSeriesResponse.json();
+        
         if (timeSeriesData.status === 'error' || !timeSeriesData.values) {
             console.error('TwelveData Error:', timeSeriesData);
             return res.status(500).json({ 
@@ -65,9 +40,8 @@ export default async function handler(req, res) {
         // 2. Get current quote data
         const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
-        if (!quoteResponse.ok) throw new Error('TwelveData API quote request failed');
-        
         const quoteData = await quoteResponse.json();
+        
         if (quoteData.status === 'error') {
             console.error('TwelveData Error:', quoteData);
             return res.status(500).json({ 
@@ -76,8 +50,8 @@ export default async function handler(req, res) {
             });
         }
 
-        // Process price data
-        const values = timeSeriesData.values.reverse();
+        // Extract price data
+        const values = timeSeriesData.values.reverse(); // Reverse to get chronological order
         const closes = values.map(v => parseFloat(v.close));
         const highs = values.map(v => parseFloat(v.high));
         const lows = values.map(v => parseFloat(v.low));
@@ -121,12 +95,14 @@ export default async function handler(req, res) {
         }
 
         // Calculate indicators
+        // Stochastics
         const stochValues = stoch(closes, highs, lows, 14);
         const k = sma(stochValues, 1);
         const d = sma(k, 3);
         const currentK = k[k.length - 1];
         const currentD = d[d.length - 1];
 
+        // EMAs
         const highEma = ema(highs, 4);
         const lowEma = ema(lows, 4);
         const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
@@ -160,34 +136,7 @@ export default async function handler(req, res) {
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        // Prepare trade signal data
-        const tradeSignalData = {
-            symbol,
-            interval: parseInt(interval),
-            strategy,
-            price: currentClose,
-            ema21: currentEma21,
-            stochK: currentK,
-            stochD: currentD,
-            signal,
-            reason,
-            timestamp: serverTimestamp(),
-            sentToTelegram: false,
-            createdAt: new Date().toISOString()
-        };
-
-        let docRef;
-        if (db) {
-            try {
-                docRef = await addDoc(collection(db, 'tradeSignals'), tradeSignalData);
-                console.log('Document written with ID: ', docRef.id);
-            } catch (firestoreError) {
-                console.error('Firestore error:', firestoreError);
-                // Continue even if Firestore fails
-            }
-        }
-
-        // Format message for Telegram
+        // Format message
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
 💵 Price: ${currentClose.toFixed(5)}
@@ -198,7 +147,6 @@ export default async function handler(req, res) {
 
 🕒 ${new Date().toLocaleString()}`;
 
-        // Send to Telegram
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -214,18 +162,6 @@ export default async function handler(req, res) {
             throw new Error(error.description || 'Telegram API error');
         }
 
-        // Update Firestore if document was created
-        if (docRef && db) {
-            try {
-                await updateDoc(docRef, {
-                    sentToTelegram: true,
-                    telegramSentAt: serverTimestamp()
-                });
-            } catch (updateError) {
-                console.error('Failed to update Firestore document:', updateError);
-            }
-        }
-
         return res.status(200).json({ 
             success: true,
             symbol,
@@ -236,16 +172,14 @@ export default async function handler(req, res) {
             stochK: currentK,
             stochD: currentD,
             signal,
-            reason,
-            firestoreId: docRef?.id || null
+            reason
         });
 
     } catch (error) {
         console.error('Error:', error);
         return res.status(500).json({ 
             error: 'Internal Server Error',
-            details: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            details: error.message 
         });
     }
 }
