@@ -15,19 +15,40 @@ export default async function handler(req, res) {
 
     try {
         // 1. Fetch the last message from the channel
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1`;
-        const updatesResponse = await fetch(getUpdatesUrl);
-        const updatesData = await updatesResponse.json();
+        // First try getting the last channel post directly
+        const getHistoryUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getChatHistory?chat_id=${CHANNEL_ID}&limit=1`;
+        const historyResponse = await fetch(getHistoryUrl);
+        const historyData = await historyResponse.json();
 
-        if (!updatesResponse.ok || !updatesData.result || updatesData.result.length === 0) {
-            throw new Error('No messages found in channel or failed to fetch updates');
+        let lastMessage = null;
+
+        // Check if we got a message from getChatHistory
+        if (historyData.ok && historyData.result && historyData.result.messages && historyData.result.messages.length > 0) {
+            const messageObj = historyData.result.messages[0];
+            lastMessage = messageObj.text || messageObj.caption || null;
         }
 
-        const lastMessage = updatesData.result[0].message?.text || 
-                           updatesData.result[0].channel_post?.text;
-        
+        // If not found, try getUpdates as fallback
         if (!lastMessage) {
-            return res.status(404).json({ error: 'No text message found in the last update' });
+            const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=1`;
+            const updatesResponse = await fetch(getUpdatesUrl);
+            const updatesData = await updatesResponse.json();
+
+            if (updatesData.ok && updatesData.result && updatesData.result.length > 0) {
+                const update = updatesData.result[0];
+                // Check different message locations in the update object
+                if (update.message) {
+                    lastMessage = update.message.text || update.message.caption || null;
+                } else if (update.channel_post) {
+                    lastMessage = update.channel_post.text || update.channel_post.caption || null;
+                } else if (update.edited_message) {
+                    lastMessage = update.edited_message.text || update.edited_message.caption || null;
+                }
+            }
+        }
+
+        if (!lastMessage) {
+            return res.status(404).json({ error: 'No text message found in the channel' });
         }
 
         // 2. Post the same message back to the channel
@@ -37,7 +58,7 @@ export default async function handler(req, res) {
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: `🔁 Reposting last message:\n\n${lastMessage}`,
-                parse_mode: 'Markdown'
+                parse_mode: 'HTML' // Using HTML to preserve emojis and formatting
             })
         });
 
@@ -49,7 +70,8 @@ export default async function handler(req, res) {
         return res.status(200).json({ 
             success: true,
             originalMessage: lastMessage,
-            reposted: true
+            reposted: true,
+            note: 'Emojis and formatting should be preserved'
         });
 
     } catch (error) {
