@@ -1,11 +1,9 @@
 export default async function handler(req, res) {
-    // 1. Ensure the request method is GET
     if (req.method !== 'GET') {
         res.setHeader('Allow', ['GET']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
 
-    // 2. Load and validate environment variables
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
@@ -16,10 +14,12 @@ export default async function handler(req, res) {
     try {
         // --- STEP 1: Fetch the last message from the Telegram channel ---
 
-        // The `getUpdates` method fetches recent updates. `limit=1` gets the very last one.
-        // We need to use a large negative offset to ensure we get the last update.
-        // A more reliable way is to just use limit=1 and take the last element of the result array.
-        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1`;
+        // Improved URL:
+        // - `allowed_updates=["channel_post"]`: This is the key change. We explicitly tell Telegram
+        //   to only send us updates about new messages in the channel, ignoring everything else.
+        // - `limit=1`: Get only the most recent one.
+        const allowedUpdates = encodeURIComponent(JSON.stringify(["channel_post"]));
+        const getUpdatesUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?chat_id=${CHANNEL_ID}&limit=1&allowed_updates=${allowedUpdates}`;
         
         const updatesResponse = await fetch(getUpdatesUrl);
         const updatesData = await updatesResponse.json();
@@ -32,23 +32,35 @@ export default async function handler(req, res) {
         if (!updatesData.result || updatesData.result.length === 0) {
             return res.status(404).json({ 
                 success: false, 
-                message: 'No messages found in the channel to repost.' 
+                message: 'No recent channel messages found to repost.' 
             });
         }
 
-        // The result is an array of updates. The last one is the most recent.
         const lastUpdate = updatesData.result[updatesData.result.length - 1];
+        const post = lastUpdate.channel_post;
 
-        // A channel message is identified by `channel_post`. We need to ensure it exists and has text.
-        if (!lastUpdate.channel_post || !lastUpdate.channel_post.text) {
+        // A post might not exist if the update is malformed (highly unlikely with allowed_updates)
+        if (!post) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Could not find a valid channel post in the last update.' 
+            });
+        }
+
+        // Improved text extraction:
+        // A message's content can be in '.text' (for a standard text message)
+        // or in '.caption' (for a photo, video, or document with a caption).
+        // This line checks for text first, and if it's not there, checks for a caption.
+        const messageToRepost = post.text || post.caption;
+
+        if (!messageToRepost) {
              return res.status(400).json({ 
                 success: false, 
-                message: 'The latest update was not a text message and cannot be reposted.' 
+                message: 'The latest channel post was not a text message or did not have a caption, and cannot be reposted.' 
             });
         }
 
-        const messageToRepost = lastUpdate.channel_post.text;
-        const originalMessageId = lastUpdate.channel_post.message_id;
+        const originalMessageId = post.message_id;
 
         // --- STEP 2: Post the message back to the channel ---
 
@@ -56,14 +68,13 @@ export default async function handler(req, res) {
         
         const repostResponse = await fetch(sendMessageUrl, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CHANNEL_ID,
                 text: messageToRepost,
-                // Note: This simple repost does not preserve formatting (Markdown/HTML)
-                // from the original message. It just sends the raw text content.
+                // Add parse_mode to preserve formatting like bold, italics, etc.
+                // from the original message.
+                parse_mode: 'Markdown'
             }),
         });
         
@@ -75,7 +86,6 @@ export default async function handler(req, res) {
 
         const repostData = await repostResponse.json();
 
-        // 3. Return a success response
         return res.status(200).json({
             success: true,
             message: 'Successfully fetched and reposted the last message.',
