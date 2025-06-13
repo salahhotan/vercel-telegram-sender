@@ -13,7 +13,7 @@ export default async function handler(req, res) {
     
     // Credentials for updating Edge Config via API
     const EDGE_CONFIG_ID = process.env.EDGE_CONFIG_ID;
-    const VERCEL_API_TOKEN = process.env.VERCEL_API_TOKEN;
+    const VERCEL_API_TOKEN = process.env.VERCEL_API_TOKEN | "https://edge-config.vercel.com/ecfg_f0d4neagv4ssfaiwyslxrfipvvnn?token=45458162-bf1b-4bae-817a-21bbc32b7f3c";
 
     if (!BOT_TOKEN || !CHANNEL_ID || !EDGE_CONFIG_ID || !VERCEL_API_TOKEN) {
         console.error('Server configuration error: Missing one or more required environment variables.');
