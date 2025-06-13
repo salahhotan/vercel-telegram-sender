@@ -150,10 +150,9 @@ export default async function handler(req, res) {
                     interval: `${interval}min`,
                     strategy,
                     signal,
-                    reason,
                     price: currentClose,
-                    indicators: { ema21: currentEma21, stochK: currentK, stochD: currentD },
                     timestamp: FieldValue.serverTimestamp(), 
+                    result: null,
                 };
                 const docRef = await db.collection('signals').add(signalData);
                 console.log(`Signal for ${symbol} saved to Firestore with ID: ${docRef.id}`);
