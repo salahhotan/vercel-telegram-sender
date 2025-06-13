@@ -1,15 +1,48 @@
+import admin from 'firebase-admin';
+
+// --- START: FIREBASE INITIALIZATION ---
+// This block initializes the Firebase Admin SDK.
+
+// 1. Check if the Firebase credentials are provided in the environment.
+if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    console.error('Firebase credentials not found in GOOGLE_SERVICE_ACCOUNT_JSON environment variable.');
+} else {
+    // 2. Prevent re-initialization errors in a serverless environment.
+    // This checks if the app is already initialized before trying to initialize it again.
+    if (!admin.apps.length) {
+        try {
+            const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
+            });
+        } catch (e) {
+            console.error('Error parsing Firebase credentials or initializing app:', e);
+        }
+    }
+}
+
+// 3. Get a reference to the Firestore database service.
+// We get it here so it's ready to use in the handler.
+const db = admin.firestore();
+// --- END: FIREBASE INITIALIZATION ---
+
+
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         res.setHeader('Allow', ['GET', 'POST']);
         return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
     }
- 
+
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
     const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         return res.status(500).json({ error: 'Missing Telegram configuration' });
+    }
+    // Check if Firebase was initialized successfully before proceeding
+    if (!admin.apps.length) {
+        return res.status(500).json({ error: 'Firebase Admin SDK not initialized. Check server logs for details.' });
     }
 
     try {
@@ -37,7 +70,7 @@ export default async function handler(req, res) {
             });
         }
 
-        // 2. Get current quote data
+        // 2. Get current quote data (This section is unchanged)
         const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
         const quoteData = await quoteResponse.json();
@@ -50,20 +83,14 @@ export default async function handler(req, res) {
             });
         }
 
-        // Extract price data
-        const values = timeSeriesData.values.reverse(); // Reverse to get chronological order
+        // --- All of your existing indicator calculation logic remains unchanged ---
+        const values = timeSeriesData.values.reverse();
         const closes = values.map(v => parseFloat(v.close));
         const highs = values.map(v => parseFloat(v.high));
         const lows = values.map(v => parseFloat(v.low));
         const opens = values.map(v => parseFloat(v.open));
-        
-        // Current price data
         const currentClose = closes[closes.length - 1];
         const currentOpen = opens[opens.length - 1];
-        const currentHigh = highs[highs.length - 1];
-        const currentLow = lows[lows.length - 1];
-
-        // Helper functions for indicators
         function sma(values, period) {
             const result = [];
             for (let i = period - 1; i < values.length; i++) {
@@ -72,7 +99,6 @@ export default async function handler(req, res) {
             }
             return result;
         }
-
         function stoch(close, high, low, period) {
             const result = [];
             for (let i = period - 1; i < close.length; i++) {
@@ -84,7 +110,6 @@ export default async function handler(req, res) {
             }
             return result;
         }
-
         function ema(values, period) {
             const k = 2 / (period + 1);
             const result = [values[0]];
@@ -93,38 +118,20 @@ export default async function handler(req, res) {
             }
             return result;
         }
-
-        // Calculate indicators
-        // Stochastics
         const stochValues = stoch(closes, highs, lows, 14);
         const k = sma(stochValues, 1);
         const d = sma(k, 3);
         const currentK = k[k.length - 1];
         const currentD = d[d.length - 1];
-
-        // EMAs
         const highEma = ema(highs, 4);
         const lowEma = ema(lows, 4);
         const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
         const ema21 = ema(closes, 21);
         const currentEma21 = ema21[ema21.length - 1];
-
-        // Strategy conditions
-        const buyCondition = currentClose < lowEma[lowEma.length - 1] && 
-                            currentOpen < hl2 && 
-                            currentClose < currentEma21 && 
-                            currentD < 50 && 
-                            currentK < 50;
-
-        const sellCondition = currentClose > highEma[highEma.length - 1] && 
-                             currentOpen > hl2 && 
-                             currentClose > currentEma21 && 
-                             currentD > 50 && 
-                             currentK > 50;
-
+        const buyCondition = currentClose < lowEma[lowEma.length - 1] && currentOpen < hl2 && currentClose < currentEma21 && currentD < 50 && currentK < 50;
+        const sellCondition = currentClose > highEma[highEma.length - 1] && currentOpen > hl2 && currentClose > currentEma21 && currentD > 50 && currentK > 50;
         let signal = "HOLD";
         let reason = "";
-        
         if (buyCondition) {
             signal = "BUY";
             reason = `EMA/Stoch strategy BUY signal: Close below Low EMA, Open below HL2, Close below 21 EMA, Stoch K/D below 50 (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
@@ -135,8 +142,9 @@ export default async function handler(req, res) {
             signal = "HOLD";
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
+        // --- End of unchanged logic ---
 
-        // Format message
+        // Format message (unchanged)
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
 💵 Price: ${currentClose.toFixed(5)}
@@ -147,6 +155,7 @@ export default async function handler(req, res) {
 
 🕒 ${new Date().toLocaleString()}`;
 
+        // Send message to Telegram (unchanged)
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -162,8 +171,20 @@ export default async function handler(req, res) {
             throw new Error(error.description || 'Telegram API error');
         }
 
+        // --- NEW: SAVE THE SENT MESSAGE TO FIRESTORE ---
+        // This will create a document named 'latest_signal' inside a 'bot_state' collection.
+        // If the document already exists, it will be overwritten with the new message.
+        const docRef = db.collection('bot_state').doc('latest_signal');
+        await docRef.set({
+            message_content: message,
+            sentAt: new Date(),
+            symbol: symbol
+        });
+
+        // Return success response (unchanged structure, added a confirmation field)
         return res.status(200).json({ 
             success: true,
+            message_saved_to_firestore: true, // Confirmation that the save was successful
             symbol,
             interval,
             strategy,
