@@ -1,5 +1,4 @@
-import { getEdgeConfig } from '@vercel/edge-config';
-import { createClient } from '@vercel/kv';
+import { set } from '@vercel/edge-config';
 
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
@@ -9,18 +8,12 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+    const EDGE_CONFIG = process.env.EDGE_CONFIG; // Vercel Edge Config connection string
     const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
-    const EDGE_CONFIG = process.env.EDGE_CONFIG;
 
-    if (!BOT_TOKEN || !CHANNEL_ID) {
-        return res.status(500).json({ error: 'Missing Telegram configuration' });
+    if (!BOT_TOKEN || !CHANNEL_ID || !EDGE_CONFIG) {
+        return res.status(500).json({ error: 'Missing required configuration (Telegram or Edge Config)' });
     }
-
-    if (!EDGE_CONFIG) {
-        return res.status(500).json({ error: 'Missing Edge Config configuration' });
-    }
-
-    const edgeConfig = await getEdgeConfig(EDGE_CONFIG);
 
     try {
         const { symbol, interval, strategy } = req.method === 'GET' ? req.query : req.body;
@@ -29,12 +22,12 @@ export default async function handler(req, res) {
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        // Normalize symbol for TwelveData API
+        // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
         const twelveDataSymbol = symbol.includes('/') 
-            ? `${symbol.replace('/', '/')}`
+            ? `${symbol.replace('/', '/')}` // Keep as EUR/USD for forex
             : symbol;
 
-        // Get time series data
+        // 1. Get time series data for price change calculation
         const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
         const timeSeriesData = await timeSeriesResponse.json();
@@ -47,7 +40,7 @@ export default async function handler(req, res) {
             });
         }
 
-        // Get current quote data
+        // 2. Get current quote data
         const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
         const quoteData = await quoteResponse.json();
@@ -61,7 +54,7 @@ export default async function handler(req, res) {
         }
 
         // Extract price data
-        const values = timeSeriesData.values.reverse();
+        const values = timeSeriesData.values.reverse(); // Reverse to get chronological order
         const closes = values.map(v => parseFloat(v.close));
         const highs = values.map(v => parseFloat(v.high));
         const lows = values.map(v => parseFloat(v.low));
@@ -105,12 +98,14 @@ export default async function handler(req, res) {
         }
 
         // Calculate indicators
+        // Stochastics
         const stochValues = stoch(closes, highs, lows, 14);
         const k = sma(stochValues, 1);
         const d = sma(k, 3);
         const currentK = k[k.length - 1];
         const currentD = d[d.length - 1];
 
+        // EMAs
         const highEma = ema(highs, 4);
         const lowEma = ema(lows, 4);
         const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
@@ -144,40 +139,7 @@ export default async function handler(req, res) {
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        // Create signal data object
-        const signalData = {
-            symbol,
-            interval,
-            strategy,
-            timestamp: new Date().toISOString(),
-            price: currentClose,
-            ema21: currentEma21,
-            stochK: currentK,
-            stochD: currentD,
-            signal,
-            reason
-        };
-
-        // Store signal in Edge Config
-        try {
-            // Get current signals
-            const currentSignals = await edgeConfig.get('signals') || [];
-            
-            // Add new signal (limit to 100 most recent)
-            const updatedSignals = [signalData, ...currentSignals].slice(0, 100);
-            
-            // Update Edge Config
-            await edgeConfig.update({
-                signals: updatedSignals
-            });
-            
-            console.log('Signal stored in Edge Config');
-        } catch (edgeError) {
-            console.error('Error storing signal in Edge Config:', edgeError);
-            // Don't fail the whole request if Edge Config storage fails
-        }
-
-        // Format message for Telegram
+        // Format message
         const message = `📈 ${symbol} Trade Signal (${strategy})
 ⏰ Interval: ${interval}min
 💵 Price: ${currentClose.toFixed(5)}
@@ -188,7 +150,6 @@ export default async function handler(req, res) {
 
 🕒 ${new Date().toLocaleString()}`;
 
-        // Send to Telegram
         const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -204,9 +165,29 @@ export default async function handler(req, res) {
             throw new Error(error.description || 'Telegram API error');
         }
 
+        // --- NEW CODE START ---
+        // After successfully sending the signal, save it to Vercel Edge Config
+        try {
+            const edgeConfigKey = `signal_${symbol.replace('/', '')}_${interval}min`;
+            await set(edgeConfigKey, signal);
+        } catch (edgeConfigError) {
+            // Log the error but don't fail the request,
+            // as the primary action (Telegram notification) was successful.
+            console.error('Failed to save signal to Edge Config:', edgeConfigError);
+        }
+        // --- NEW CODE END ---
+
         return res.status(200).json({ 
             success: true,
-            ...signalData
+            symbol,
+            interval,
+            strategy,
+            currentPrice: currentClose,
+            ema21: currentEma21,
+            stochK: currentK,
+            stochD: currentD,
+            signal,
+            reason
         });
 
     } catch (error) {
