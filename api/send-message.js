@@ -1,4 +1,4 @@
-// NOTE: There is NO import from '@vercel/edge-config'
+// NOTE: There  . is NO import from '@vercel/edge-config'
 
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
