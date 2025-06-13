@@ -1,7 +1,7 @@
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
-// --- Firebase Admin Initialization (same as your first script) ---
+// --- Firebase Admin Initialization ---
 const serviceAccount = {
   projectId: process.env.FIREBASE_PROJECT_ID,
   clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
@@ -22,7 +22,6 @@ const db = getFirestore();
 
 export default async function handler(req, res) {
     // --- Security Check ---
-    // We only allow GET requests with a valid secret key
     const { secret } = req.query;
     if (req.method !== 'GET' || secret !== process.env.CRON_SECRET) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -30,32 +29,42 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
+    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY;
 
     if (!BOT_TOKEN || !CHANNEL_ID || !TWELVEDATA_API_KEY) {
         return res.status(500).json({ error: 'Missing server configuration' });
     }
 
     try {
-        // 1. Find the latest signal that has NOT been checked yet
+        // 1. Get the single most recent signal, regardless of its status.
         const signalsRef = db.collection('signals');
-        const snapshot = await signalsRef
-            .where('result', '==', null) // Find signals without a 'result' field
+        const latestSignalSnapshot = await signalsRef
             .orderBy('timestamp', 'desc') // Get the most recent one first
             .limit(1)
             .get();
 
-        if (snapshot.empty) {
-            console.log('No unchecked signals found.');
-            return res.status(200).json({ message: 'No unchecked signals found.' });
+        // Exit if the 'signals' collection is completely empty.
+        if (latestSignalSnapshot.empty) {
+            console.log('No signals found in the collection to check.');
+            return res.status(200).json({ message: 'No signals found to check.' });
         }
         
-        const signalDoc = snapshot.docs[0];
+        const signalDoc = latestSignalSnapshot.docs[0];
         const signalData = signalDoc.data();
         const signalId = signalDoc.id;
 
-        // 2. Fetch the latest candle data for the signal's symbol
-        // The interval should be in the format '15min', which we already stored
+        // 2. Check if this latest signal has ALREADY been processed.
+        // If 'result' is anything other than 'null', we exit.
+        if (signalData.result !== null) {
+            console.log(`Latest signal (ID: ${signalId}) already has a result: '${signalData.result}'. Exiting.`);
+            return res.status(200).json({ message: 'Latest signal already checked.' });
+        }
+
+        // --- If we reach here, it means the latest signal has result: null ---
+        // --- and we need to process it.                                  ---
+        console.log(`Found unchecked latest signal (ID: ${signalId}). Processing result...`);
+
+        // 3. Fetch the latest candle data for the signal's symbol
         const interval = signalData.interval; 
         const symbol = signalData.symbol;
 
@@ -71,7 +80,7 @@ export default async function handler(req, res) {
         const nextCandleClose = parseFloat(timeSeriesData.values[0].close);
         const entryPrice = signalData.price;
 
-        // 3. Determine the result (WIN or LOSS)
+        // 4. Determine the result (WIN or LOSS)
         let result = '';
         const priceDifference = nextCandleClose - entryPrice;
 
@@ -80,12 +89,11 @@ export default async function handler(req, res) {
         } else if (signalData.signal === 'SELL') {
             result = nextCandleClose < entryPrice ? 'WIN ✅' : 'LOSS ❌';
         } else {
-             // If signal was something else, mark as checked to avoid re-processing
             await signalsRef.doc(signalId).update({ result: 'INVALID' });
             return res.status(200).json({ message: 'Invalid signal type, marked as checked.' });
         }
 
-        // 4. Send the result to the Telegram channel
+        // 5. Send the result to the Telegram channel
         const resultMessage = `--- Signal Result ---
 📈 Symbol: ${symbol}
 🚦 Original Signal: ${signalData.signal} at ${entryPrice.toFixed(5)}
@@ -94,7 +102,7 @@ export default async function handler(req, res) {
 🏆 Result: ${result}
         `;
 
-        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -103,11 +111,7 @@ export default async function handler(req, res) {
             })
         });
 
-        if (!telegramResponse.ok) {
-            throw new Error('Failed to send result to Telegram');
-        }
-
-        // 5. Update the signal document in Firestore with the result
+        // 6. Update the signal document in Firestore with the result
         await signalsRef.doc(signalId).update({
             result: result.split(' ')[0], // Store just 'WIN' or 'LOSS'
             resultPrice: nextCandleClose,
