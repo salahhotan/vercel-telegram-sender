@@ -1,80 +1,113 @@
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, serverTimestamp, updateDoc, doc } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
 
-// Initialize Firebase
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID
-};
-
-// Initialize Firebase only if config values exist
+// Initialize Firebase only if config exists
 let db;
-if (firebaseConfig.apiKey) {
+if (process.env.FIREBASE_API_KEY) {
   try {
+    const firebaseConfig = {
+      apiKey: process.env.FIREBASE_API_KEY,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+      appId: process.env.FIREBASE_APP_ID
+    };
     const firebaseApp = initializeApp(firebaseConfig);
     db = getFirestore(firebaseApp);
-  } catch (error) {
-    console.error('Firebase initialization error:', error);
+  } catch (firebaseError) {
+    console.error('Firebase initialization error:', firebaseError);
   }
 }
 
 export default async function handler(req, res) {
-    if (req.method !== 'GET' && req.method !== 'POST') {
-        res.setHeader('Allow', ['GET', 'POST']);
-        return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
-    }
-
-    const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-    const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
-
-    if (!BOT_TOKEN || !CHANNEL_ID) {
-        return res.status(500).json({ error: 'Missing Telegram configuration' });
-    }
+    // Set response headers
+    res.setHeader('Content-Type', 'application/json');
 
     try {
-        const { symbol, interval, strategy } = req.method === 'GET' ? req.query : req.body;
-        
-        if (!symbol) return res.status(400).json({ error: 'Missing symbol parameter' });
-        if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
-        if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
+        // Validate HTTP method
+        if (req.method !== 'GET' && req.method !== 'POST') {
+            res.setHeader('Allow', ['GET', 'POST']);
+            return res.status(405).json({ 
+                error: `Method ${req.method} Not Allowed`,
+                message: 'Only GET or POST requests are supported'
+            });
+        }
 
-        // Normalize symbol for TwelveData API
+        // Check required environment variables
+        const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+        const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+        const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY;
+
+        if (!BOT_TOKEN || !CHANNEL_ID) {
+            return res.status(500).json({ 
+                error: 'Configuration Error',
+                message: 'Missing Telegram bot token or channel ID'
+            });
+        }
+
+        if (!TWELVEDATA_API_KEY) {
+            return res.status(500).json({ 
+                error: 'Configuration Error',
+                message: 'Missing TwelveData API key'
+            });
+        }
+
+        // Extract parameters
+        const params = req.method === 'GET' ? req.query : req.body;
+        const { symbol, interval, strategy } = params;
+
+        // Validate parameters
+        if (!symbol || !interval || !strategy) {
+            return res.status(400).json({
+                error: 'Missing Parameters',
+                message: 'symbol, interval, and strategy are all required',
+                received: { symbol, interval, strategy }
+            });
+        }
+
+        // Normalize symbol
         const twelveDataSymbol = symbol.includes('/') 
-            ? symbol.replace('/', '/')
+            ? symbol.replace('/', '/') 
             : symbol;
 
-        // 1. Get time series data
+        // 1. Fetch time series data
         const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
-        if (!timeSeriesResponse.ok) throw new Error('TwelveData API time series request failed');
         
-        const timeSeriesData = await timeSeriesResponse.json();
-        if (timeSeriesData.status === 'error' || !timeSeriesData.values) {
-            console.error('TwelveData Error:', timeSeriesData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch time series data',
-                details: timeSeriesData.message || 'Invalid symbol or API issue'
+        if (!timeSeriesResponse.ok) {
+            const errorData = await timeSeriesResponse.json();
+            return res.status(500).json({
+                error: 'API Error',
+                message: 'Failed to fetch time series data',
+                details: errorData
             });
         }
 
-        // 2. Get current quote data
-        const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
-        const quoteResponse = await fetch(quoteUrl);
-        if (!quoteResponse.ok) throw new Error('TwelveData API quote request failed');
-        
-        const quoteData = await quoteResponse.json();
-        if (quoteData.status === 'error') {
-            console.error('TwelveData Error:', quoteData);
-            return res.status(500).json({ 
-                error: 'Failed to fetch quote data',
-                details: quoteData.message || 'Invalid symbol or API issue'
+        const timeSeriesData = await timeSeriesResponse.json();
+
+        if (!timeSeriesData.values || timeSeriesData.values.length < 2) {
+            return res.status(500).json({
+                error: 'Data Error',
+                message: 'Insufficient data points received',
+                data: timeSeriesData
             });
         }
+
+        // 2. Fetch quote data
+        const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
+        const quoteResponse = await fetch(quoteUrl);
+        
+        if (!quoteResponse.ok) {
+            const errorData = await quoteResponse.json();
+            return res.status(500).json({
+                error: 'API Error',
+                message: 'Failed to fetch quote data',
+                details: errorData
+            });
+        }
+
+        const quoteData = await quoteResponse.json();
 
         // Process price data
         const values = timeSeriesData.values.reverse();
@@ -160,7 +193,7 @@ export default async function handler(req, res) {
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        // Prepare trade signal data
+        // Prepare trade signal data for Firestore
         const tradeSignalData = {
             symbol,
             interval: parseInt(interval),
@@ -180,10 +213,10 @@ export default async function handler(req, res) {
         if (db) {
             try {
                 docRef = await addDoc(collection(db, 'tradeSignals'), tradeSignalData);
-                console.log('Document written with ID: ', docRef.id);
+                console.log('Firestore document created with ID:', docRef.id);
             } catch (firestoreError) {
-                console.error('Firestore error:', firestoreError);
-                // Continue even if Firestore fails
+                console.error('Firestore create error:', firestoreError);
+                // Continue execution even if Firestore fails
             }
         }
 
@@ -211,7 +244,7 @@ export default async function handler(req, res) {
 
         if (!telegramResponse.ok) {
             const error = await telegramResponse.json();
-            throw new Error(error.description || 'Telegram API error');
+            throw new Error(`Telegram API error: ${error.description || 'Unknown error'}`);
         }
 
         // Update Firestore if document was created
@@ -221,11 +254,13 @@ export default async function handler(req, res) {
                     sentToTelegram: true,
                     telegramSentAt: serverTimestamp()
                 });
+                console.log('Firestore document updated with Telegram status');
             } catch (updateError) {
-                console.error('Failed to update Firestore document:', updateError);
+                console.error('Firestore update error:', updateError);
             }
         }
 
+        // Successful response
         return res.status(200).json({ 
             success: true,
             symbol,
@@ -237,15 +272,29 @@ export default async function handler(req, res) {
             stochD: currentD,
             signal,
             reason,
-            firestoreId: docRef?.id || null
+            firestoreId: docRef?.id || null,
+            message: 'Signal processed and sent successfully'
         });
 
     } catch (error) {
-        console.error('Error:', error);
-        return res.status(500).json({ 
+        // Detailed error logging
+        console.error('Full Error:', {
+            message: error.message,
+            stack: error.stack,
+            request: {
+                method: req.method,
+                query: req.query,
+                body: req.body
+            }
+        });
+
+        return res.status(500).json({
             error: 'Internal Server Error',
-            details: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            message: error.message,
+            requestId: req.headers['x-vercel-id'],
+            ...(process.env.NODE_ENV === 'development' && {
+                stack: error.stack
+            })
         });
     }
 }
