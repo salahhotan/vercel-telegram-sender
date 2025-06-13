@@ -1,7 +1,7 @@
 {
   "name": "vercel-telegram-sender",
   "version": "1.0.0",
-  "description": "Vercel serverless function to send messages to a Telegram channel and store signals in Firebase.",
+  "description": "Vercel serverless function to send messages to a Telegram channel and store signals in Vercel KV/Edge Config.",
   "main": "api/send-message.js",
   "type": "module",
   "scripts": {
@@ -13,8 +13,8 @@
     "vercel",
     "serverless",
     "telegram",
-    "firebase",
-    "firestore",
+    "kv",
+    "edge-config",
     "trading",
     "bot",
     "nodejs"
@@ -24,11 +24,11 @@
   "engines": {
     "node": ">=18.x"
   },
-"dependencies": {
-    "firebase": "^10.7.0",
-    "firebase-admin": "^13.1.0",
+  "dependencies": {
+    "@vercel/edge-config": "^1.0.0",
+    "@vercel/kv": "^0.0.0",
     "node-fetch": "^3.3.1"
-}
+  },
   "devDependencies": {
     "vercel": "^32.5.1"
   }
