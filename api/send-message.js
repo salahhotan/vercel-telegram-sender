@@ -1,3 +1,4 @@
+import { getEdgeConfig } from '@vercel/edge-config';
 import { createClient } from '@vercel/kv';
 
 export default async function handler(req, res) {
@@ -9,21 +10,17 @@ export default async function handler(req, res) {
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
     const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
-    const KV_REST_API_URL = process.env.KV_REST_API_URL;
-    const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN;
+    const EDGE_CONFIG = process.env.EDGE_CONFIG;
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         return res.status(500).json({ error: 'Missing Telegram configuration' });
     }
 
-    if (!KV_REST_API_URL || !KV_REST_API_TOKEN) {
-        return res.status(500).json({ error: 'Missing Vercel KV configuration' });
+    if (!EDGE_CONFIG) {
+        return res.status(500).json({ error: 'Missing Edge Config configuration' });
     }
 
-    const kv = createClient({
-        url: KV_REST_API_URL,
-        token: KV_REST_API_TOKEN,
-    });
+    const edgeConfig = await getEdgeConfig(EDGE_CONFIG);
 
     try {
         const { symbol, interval, strategy } = req.method === 'GET' ? req.query : req.body;
@@ -32,12 +29,12 @@ export default async function handler(req, res) {
         if (!interval) return res.status(400).json({ error: 'Missing interval parameter' });
         if (!strategy) return res.status(400).json({ error: 'Missing strategy parameter' });
 
-        // Normalize symbol for TwelveData API (forex pairs use format: EUR/USD)
+        // Normalize symbol for TwelveData API
         const twelveDataSymbol = symbol.includes('/') 
             ? `${symbol.replace('/', '/')}`
             : symbol;
 
-        // 1. Get time series data for price change calculation
+        // Get time series data
         const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
         const timeSeriesData = await timeSeriesResponse.json();
@@ -50,7 +47,7 @@ export default async function handler(req, res) {
             });
         }
 
-        // 2. Get current quote data
+        // Get current quote data
         const quoteUrl = `https://api.twelvedata.com/quote?symbol=${twelveDataSymbol}&apikey=${TWELVEDATA_API_KEY}`;
         const quoteResponse = await fetch(quoteUrl);
         const quoteData = await quoteResponse.json();
@@ -64,7 +61,7 @@ export default async function handler(req, res) {
         }
 
         // Extract price data
-        const values = timeSeriesData.values.reverse(); // Reverse to get chronological order
+        const values = timeSeriesData.values.reverse();
         const closes = values.map(v => parseFloat(v.close));
         const highs = values.map(v => parseFloat(v.high));
         const lows = values.map(v => parseFloat(v.low));
@@ -108,14 +105,12 @@ export default async function handler(req, res) {
         }
 
         // Calculate indicators
-        // Stochastics
         const stochValues = stoch(closes, highs, lows, 14);
         const k = sma(stochValues, 1);
         const d = sma(k, 3);
         const currentK = k[k.length - 1];
         const currentD = d[d.length - 1];
 
-        // EMAs
         const highEma = ema(highs, 4);
         const lowEma = ema(lows, 4);
         const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
@@ -163,24 +158,23 @@ export default async function handler(req, res) {
             reason
         };
 
-        // Store signal in Vercel KV
+        // Store signal in Edge Config
         try {
-            // Create a unique key for this signal
-            const signalKey = `signal:${symbol}:${interval}:${Date.now()}`;
+            // Get current signals
+            const currentSignals = await edgeConfig.get('signals') || [];
             
-            // Store the signal data
-            await kv.hset(signalKey, signalData);
+            // Add new signal (limit to 100 most recent)
+            const updatedSignals = [signalData, ...currentSignals].slice(0, 100);
             
-            // Also add to a sorted set for time-based retrieval
-            await kv.zadd(`signals:${symbol}:${interval}`, {
-                score: Date.now(),
-                member: signalKey
+            // Update Edge Config
+            await edgeConfig.update({
+                signals: updatedSignals
             });
             
-            console.log('Signal stored in Vercel KV:', signalKey);
-        } catch (kvError) {
-            console.error('Error storing signal in Vercel KV:', kvError);
-            // Don't fail the whole request if KV storage fails
+            console.log('Signal stored in Edge Config');
+        } catch (edgeError) {
+            console.error('Error storing signal in Edge Config:', edgeError);
+            // Don't fail the whole request if Edge Config storage fails
         }
 
         // Format message for Telegram
