@@ -129,22 +129,12 @@ export default async function handler(req, res) {
             reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
         }
 
-        const message = `📈 ${symbol} Trade Signal (${strategy})...`; // (your message format)
+        // --- OLD TELEGRAM MESSAGE LOGIC REMOVED FROM HERE ---
 
-        const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: CHANNEL_ID, text: message, parse_mode: 'Markdown' })
-        });
-
-        if (!telegramResponse.ok) {
-            const error = await telegramResponse.json();
-            throw new Error(error.description || 'Telegram API error');
-        }
-
-        // Save to Firestore if it's a BUY or SELL signal
+        // Save to Firestore and send to Telegram if it's a BUY or SELL signal
         if (signal !== 'HOLD') {
             try {
+                // 1. Data to be saved and sent
                 const signalData = {
                     symbol,
                     interval: `${interval}min`,
@@ -154,9 +144,48 @@ export default async function handler(req, res) {
                     timestamp: FieldValue.serverTimestamp(), 
                     result: null,
                 };
+                
+                // 2. Save to Firestore
                 const docRef = await db.collection('signals').add(signalData);
                 console.log(`Signal for ${symbol} saved to Firestore with ID: ${docRef.id}`);
+
+                // 3. Prepare and send the detailed message to Telegram
+                const signalEmoji = signal === 'BUY' ? '🟢' : '🔴';
+                const messageForTelegram = `
+*${signalEmoji} New ${signal} Signal*
+
+*Symbol:* \`${symbol}\`
+*Price:* \`${currentClose.toFixed(5)}\`
+*Interval:* \`${interval}min\`
+*Strategy:* \`${strategy}\`
+
+*Reason:* ${reason}
+                `.trim();
+
+                // Send the message, handling potential errors gracefully
+                try {
+                    const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            chat_id: CHANNEL_ID,
+                            text: messageForTelegram,
+                            parse_mode: 'Markdown'
+                        })
+                    });
+
+                    if (!telegramResponse.ok) {
+                        const errorData = await telegramResponse.json();
+                        console.error("Failed to send Telegram message:", errorData.description);
+                    } else {
+                        console.log("Signal successfully sent to Telegram.");
+                    }
+                } catch (telegramError) {
+                    console.error("Error sending message to Telegram:", telegramError.message);
+                }
+
             } catch (firestoreError) {
+                // If saving to Firestore fails, we'll log the error and won't send to Telegram.
                 console.error("Error saving signal to Firestore:", firestoreError);
             }
         }
@@ -165,6 +194,17 @@ export default async function handler(req, res) {
 
     } catch (error) {
         console.error('Error:', error);
+        // Also notify via Telegram if the whole handler fails
+        try {
+            const errorMessage = `🚨 **API Error:**\nAn error occurred in the signal handler.\n\`\`\`\n${error.message}\n\`\`\``;
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: CHANNEL_ID, text: errorMessage, parse_mode: 'Markdown' })
+            });
+        } catch (telegramError) {
+            console.error("Also failed to send error message to Telegram:", telegramError.message);
+        }
         return res.status(500).json({ error: 'Internal Server Error', details: error.message });
     }
 }
