@@ -30,7 +30,7 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY;
+    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
 
     if (!BOT_TOKEN || !CHANNEL_ID || !TWELVEDATA_API_KEY) {
         return res.status(500).json({ error: 'Missing server configuration' });
