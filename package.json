@@ -1,4 +1,4 @@
-{
+{ 
   "name": "vercel-telegram-sender",
   "version": "1.0.0",
   "description": "Vercel serverless function to send messages to a Telegram channel and store signals in Vercel Edge Config.",
