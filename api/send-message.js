@@ -152,14 +152,13 @@ export default async function handler(req, res) {
                 // 3. Prepare and send the detailed message to Telegram
                 const signalEmoji = signal === 'BUY' ? '🟢' : '🔴';
                 const messageForTelegram = `
-*${signalEmoji} New ${signal} Signal*
+*${signalEmoji} ${signal} Signal*
 
 *Symbol:* \`${symbol}\`
-*Price:* \`${currentClose.toFixed(5)}\`
 *Interval:* \`${interval}min\`
+*Price:* \`${currentClose.toFixed(2)}\`
 *Strategy:* \`${strategy}\`
 
-*Reason:* ${reason}
                 `.trim();
 
                 // Send the message, handling potential errors gracefully
