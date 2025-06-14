@@ -94,16 +94,15 @@ export default async function handler(req, res) {
         }
 
         // 5. Send the result to the Telegram channel
-        const resultMessage = `🚀 *TRADE RESULT* 🚀
-
-▫️ *Symbol:* \`${symbol}\`
-▫️ *Signal:* ${signalData.signal === 'BUY' ? '🟢 BUY' : '🔴 SELL'} at ${entryPrice.toFixed(5)}
-▫️ *Next Close:* ${nextCandleClose.toFixed(2)}
-▫️ *P/L:* ${priceDifference >= 0 ? '🟢' : '🔴'} ${priceDifference.toFixed(2)} points
-▫️ *Result:* ${result}
-
-📊 *Performance Summary*
-Profit: ${priceDifference >= 0 ? '+' : ''}${priceDifference.toFixed(2)} (${(Math.abs(priceDifference)/entryPrice*100).toFixed(2)}%)`;
+        const resultMessage = `- Signal Result -
+        
+ Symbol: ${symbol}
+ Original Signal: ${signalData.signal} at ${entryPrice.toFixed(5)}
+ Next Candle Close: ${nextCandleClose.toFixed(2)}
+ P/L: ${priceDifference.toFixed(2)} points
+ Result: ${result}
+        `;
+      
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
