@@ -120,13 +120,13 @@ export default async function handler(req, res) {
         
         if (buyCondition) {
             signal = "BUY";
-            reason = `EMA/Stoch strategy BUY signal: Close below Low EMA, Open below HL2, Close below 21 EMA, Stoch K/D below 50 (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
+            
         } else if (sellCondition) {
             signal = "SELL";
-            reason = `EMA/Stoch strategy SELL signal: Close above High EMA, Open above HL2, Close above 21 EMA, Stoch K/D above 50 (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
+            
         } else {
             signal = "HOLD";
-            reason = `No clear EMA/Stoch strategy signal (K: ${currentK.toFixed(2)}, D: ${currentD.toFixed(2)})`;
+          
         }
 
         // --- OLD TELEGRAM MESSAGE LOGIC REMOVED FROM HERE ---
