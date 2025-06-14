@@ -94,12 +94,12 @@ export default async function handler(req, res) {
         }
 
         // 5. Send the result to the Telegram channel
-        const resultMessage = `--- Signal Result ---
-📈 Symbol: ${symbol}
-🚦 Original Signal: ${signalData.signal} at ${entryPrice.toFixed(5)}
-🕯️ Next Candle Close: ${nextCandleClose.toFixed(5)}
-📊 P/L: ${priceDifference.toFixed(5)} points
-🏆 Result: ${result}
+        const resultMessage = `-- Signal Result --
+ Symbol: ${symbol}
+ Original Signal: ${signalData.signal} at ${entryPrice.toFixed(5)}
+ Next Candle Close: ${nextCandleClose.toFixed(2)}
+ P/L: ${priceDifference.toFixed(2)} points
+ Result: ${result}
         `;
 
         await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
