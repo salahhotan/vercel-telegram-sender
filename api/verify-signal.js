@@ -96,7 +96,7 @@ export default async function handler(req, res) {
         // 5. Send the result to the Telegram channel
         const resultMessage = `- Signal Result -
         
- Symbol: ${symbol}
+*Symbol:* ${symbol}
  Original Signal: ${signalData.signal} at ${entryPrice.toFixed(5)}
  Next Candle Close: ${nextCandleClose.toFixed(2)}
  P/L: ${priceDifference.toFixed(2)} points
