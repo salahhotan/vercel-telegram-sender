@@ -37,7 +37,7 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || 'YOUR_DEFAULT_API_KEY'; // It's good practice to have a default
+    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         return res.status(500).json({ error: 'Missing Telegram configuration' });
