@@ -37,7 +37,7 @@ export default async function handler(req, res) {
 
     const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || '67f3f0d12887445d915142fcf85ccb59';
+    const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY || 'YOUR_DEFAULT_API_KEY'; // It's good practice to have a default
 
     if (!BOT_TOKEN || !CHANNEL_ID) {
         return res.status(500).json({ error: 'Missing Telegram configuration' });
@@ -66,7 +66,6 @@ export default async function handler(req, res) {
             });
         }
         
-        // ... (rest of your logic for calculating indicators remains the same)
         const values = timeSeriesData.values.reverse();
         const closes = values.map(v => parseFloat(v.close));
         const highs = values.map(v => parseFloat(v.high));
@@ -75,7 +74,9 @@ export default async function handler(req, res) {
         const currentClose = closes[closes.length - 1];
         const currentOpen = opens[opens.length - 1];
 
+        // --- Helper functions for indicators ---
         function sma(values, period) {
+            if (values.length < period) return [];
             const result = [];
             for (let i = period - 1; i < values.length; i++) {
                 const sum = values.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
@@ -86,14 +87,19 @@ export default async function handler(req, res) {
         function stoch(close, high, low, period) {
             const result = [];
             for (let i = period - 1; i < close.length; i++) {
-                const highestHigh = Math.max(...high.slice(i - period + 1, i + 1));
-                const lowestLow = Math.min(...low.slice(i - period + 1, i + 1));
+                const sliceHigh = high.slice(i - period + 1, i + 1);
+                const sliceLow = low.slice(i - period + 1, i + 1);
+                if (sliceHigh.length === 0 || sliceLow.length === 0) continue;
+                const highestHigh = Math.max(...sliceHigh);
+                const lowestLow = Math.min(...sliceLow);
                 const currentClose = close[i];
-                result.push(((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100);
+                const stochValue = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+                result.push(isNaN(stochValue) ? 50 : stochValue); // Handle division by zero
             }
             return result;
         }
         function ema(values, period) {
+            if (values.length === 0) return [];
             const k = 2 / (period + 1);
             const result = [values[0]];
             for (let i = 1; i < values.length; i++) {
@@ -102,34 +108,57 @@ export default async function handler(req, res) {
             return result;
         }
 
-        const stochValues = stoch(closes, highs, lows, 14);
-        const k = sma(stochValues, 1);
-        const d = sma(k, 3);
+        // --- START OF STRATEGY REPLACEMENT ---
+
+        // 1. Define Strategy Parameters
+        const stochLength = 14;
+        const smoothK = 1;
+        const smoothD = 3;
+        const highEmaLength = 4;
+        const lowEmaLength = 4;
+        const mainEmaLength = 21;
+        const stochOversold = 20;   // <-- New Filter Parameter
+        const stochOverbought = 80; // <-- New Filter Parameter
+
+        // 2. Calculate Indicators
+        const stochValues = stoch(closes, highs, lows, stochLength);
+        const k = sma(stochValues, smoothK);
+        const d = sma(k, smoothD);
+
+        const highEma = ema(highs, highEmaLength);
+        const lowEma = ema(lows, lowEmaLength);
+        const mainEma = ema(closes, mainEmaLength);
+
+        // Ensure we have enough data to calculate all indicators
+        if (d.length === 0 || highEma.length === 0 || lowEma.length === 0 || mainEma.length === 0) {
+             return res.status(200).json({ success: true, signal: "HOLD", reason: "Not enough data to compute indicators." });
+        }
+        
         const currentK = k[k.length - 1];
         const currentD = d[d.length - 1];
-        const highEma = ema(highs, 4);
-        const lowEma = ema(lows, 4);
-        const hl2 = (highEma[highEma.length - 1] + lowEma[lowEma.length - 1]) / 2;
-        const ema21 = ema(closes, 21);
-        const currentEma21 = ema21[ema21.length - 1];
-        const buyCondition = currentClose < lowEma[lowEma.length - 1] && currentOpen < hl2 && currentClose < currentEma21 && currentD < 50 && currentK < 50;
-        const sellCondition = currentClose > highEma[highEma.length - 1] && currentOpen > hl2 && currentClose > currentEma21 && currentD > 50 && currentK > 50;
+        const currentHighEma = highEma[highEma.length - 1];
+        const currentLowEma = lowEma[lowEma.length - 1];
+        const currentHl2 = (currentHighEma + currentLowEma) / 2;
+        const currentMainEma = mainEma[mainEma.length - 1];
+
+        // 3. Define Final Buy/Sell Conditions with the Stricter Filter
+        const baseBuyCondition = currentClose < currentLowEma && currentOpen < currentHl2 && currentClose < currentMainEma;
+        const stochBuyFilter = currentK < stochOversold && currentD < stochOversold;
+        const buyCondition = baseBuyCondition && stochBuyFilter;
+
+        const baseSellCondition = currentClose > currentHighEma && currentOpen > currentHl2 && currentClose > currentMainEma;
+        const stochSellFilter = currentK > stochOverbought && currentD > stochOverbought;
+        const sellCondition = baseSellCondition && stochSellFilter;
+
+        // --- END OF STRATEGY REPLACEMENT ---
 
         let signal = "HOLD";
-        let reason = "";
         
         if (buyCondition) {
             signal = "BUY";
-            
         } else if (sellCondition) {
             signal = "SELL";
-            
-        } else {
-            signal = "HOLD";
-          
         }
-
-        // --- OLD TELEGRAM MESSAGE LOGIC REMOVED FROM HERE ---
 
         // Save to Firestore and send to Telegram if it's a BUY or SELL signal
         if (signal !== 'HOLD') {
@@ -142,7 +171,7 @@ export default async function handler(req, res) {
                     signal,
                     price: currentClose,
                     timestamp: FieldValue.serverTimestamp(), 
-                    result: null,
+                    result: null, // This field will be updated later
                 };
                 
                 // 2. Save to Firestore
@@ -156,44 +185,38 @@ export default async function handler(req, res) {
 
 *Symbol:* \`${symbol}\`
 *Interval:* \`${interval}min\`
-*Price:* \`${currentClose.toFixed(2)}\`
+*Price:* \`${currentClose.toFixed(5)}\`
 *Strategy:* \`${strategy}\`
-
                 `.trim();
 
                 // Send the message, handling potential errors gracefully
-                try {
-                    const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            chat_id: CHANNEL_ID,
-                            text: messageForTelegram,
-                            parse_mode: 'Markdown'
-                        })
-                    });
+                const telegramResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: CHANNEL_ID,
+                        text: messageForTelegram,
+                        parse_mode: 'Markdown'
+                    })
+                });
 
-                    if (!telegramResponse.ok) {
-                        const errorData = await telegramResponse.json();
-                        console.error("Failed to send Telegram message:", errorData.description);
-                    } else {
-                        console.log("Signal successfully sent to Telegram.");
-                    }
-                } catch (telegramError) {
-                    console.error("Error sending message to Telegram:", telegramError.message);
+                if (!telegramResponse.ok) {
+                    const errorData = await telegramResponse.json();
+                    console.error("Failed to send Telegram message:", errorData.description);
+                } else {
+                    console.log("Signal successfully sent to Telegram.");
                 }
 
             } catch (firestoreError) {
-                // If saving to Firestore fails, we'll log the error and won't send to Telegram.
-                console.error("Error saving signal to Firestore:", firestoreError);
+                console.error("Error saving signal to Firestore:", firestoreError.message);
             }
         }
 
-        return res.status(200).json({ success: true, signal, reason });
+        return res.status(200).json({ success: true, signal });
 
     } catch (error) {
-        console.error('Error:', error);
-        // Also notify via Telegram if the whole handler fails
+        console.error('Error in handler:', error);
+        // Notify via Telegram if the whole handler fails
         try {
             const errorMessage = `🚨 **API Error:**\nAn error occurred in the signal handler.\n\`\`\`\n${error.message}\n\`\`\``;
             await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
