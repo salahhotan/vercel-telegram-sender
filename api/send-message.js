@@ -53,8 +53,8 @@ export default async function handler(req, res) {
         // Normalize symbol for TwelveData API
         const twelveDataSymbol = symbol.includes('/') ? symbol : symbol;
 
-        // 1. Get time series data
-        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=50`;
+        // 1. Get time series data (increased outputsize for BB period)
+        const timeSeriesUrl = `https://api.twelvedata.com/time_series?symbol=${twelveDataSymbol}&interval=${interval}min&apikey=${TWELVEDATA_API_KEY}&outputsize=250`;
         const timeSeriesResponse = await fetch(timeSeriesUrl);
         const timeSeriesData = await timeSeriesResponse.json();
         
@@ -68,11 +68,7 @@ export default async function handler(req, res) {
         
         const values = timeSeriesData.values.reverse();
         const closes = values.map(v => parseFloat(v.close));
-        const highs = values.map(v => parseFloat(v.high));
-        const lows = values.map(v => parseFloat(v.low));
-        const opens = values.map(v => parseFloat(v.open));
         const currentClose = closes[closes.length - 1];
-        const currentOpen = opens[opens.length - 1];
 
         // --- Helper functions for indicators ---
         function sma(values, period) {
@@ -84,72 +80,120 @@ export default async function handler(req, res) {
             }
             return result;
         }
-        function stoch(close, high, low, period) {
+
+        // NEW: Standard Deviation function needed for Bollinger Bands
+        function stdev(values, period) {
+            if (values.length < period) return [];
             const result = [];
-            for (let i = period - 1; i < close.length; i++) {
-                const sliceHigh = high.slice(i - period + 1, i + 1);
-                const sliceLow = low.slice(i - period + 1, i + 1);
-                if (sliceHigh.length === 0 || sliceLow.length === 0) continue;
-                const highestHigh = Math.max(...sliceHigh);
-                const lowestLow = Math.min(...sliceLow);
-                const currentClose = close[i];
-                const stochValue = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
-                result.push(isNaN(stochValue) ? 50 : stochValue); // Handle division by zero
+            for (let i = period - 1; i < values.length; i++) {
+                const slice = values.slice(i - period + 1, i + 1);
+                const mean = slice.reduce((a, b) => a + b, 0) / period;
+                const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
+                result.push(Math.sqrt(variance));
             }
             return result;
         }
-        function ema(values, period) {
-            if (values.length === 0) return [];
-            const k = 2 / (period + 1);
-            const result = [values[0]];
-            for (let i = 1; i < values.length; i++) {
-                result.push(values[i] * k + result[i - 1] * (1 - k));
+        
+        // NEW: RSI function
+        function rsi(values, period) {
+            if (values.length <= period) return [];
+            const result = [];
+            let gains = 0;
+            let losses = 0;
+
+            // Calculate initial average gain and loss
+            for (let i = 1; i <= period; i++) {
+                const change = values[i] - values[i - 1];
+                if (change > 0) gains += change;
+                else losses -= change;
             }
-            return result;
+            let avgGain = gains / period;
+            let avgLoss = losses / period;
+
+            for (let i = period + 1; i < values.length; i++) {
+                const change = values[i] - values[i - 1];
+                let currentGain = change > 0 ? change : 0;
+                let currentLoss = change < 0 ? -change : 0;
+                
+                avgGain = (avgGain * (period - 1) + currentGain) / period;
+                avgLoss = (avgLoss * (period - 1) + currentLoss) / period;
+                
+                if (avgLoss === 0) {
+                     result.push(100);
+                } else {
+                    const rs = avgGain / avgLoss;
+                    result.push(100 - (100 / (1 + rs)));
+                }
+            }
+            // Add a placeholder for the initial period to align arrays
+            const initialRSI = [ ...Array(period + 1).fill(50) ];
+            return initialRSI.concat(result);
+        }
+
+        // NEW: Bollinger Bands function
+        function bb(values, period, multiplier) {
+            const basis = sma(values, period);
+            const dev = stdev(values, period);
+            if (basis.length !== dev.length) return { basis: [], upper: [], lower: []};
+
+            const upper = basis.map((val, index) => val + (dev[index] * multiplier));
+            const lower = basis.map((val, index) => val - (dev[index] * multiplier));
+            
+            // Align arrays by adding placeholders
+            const placeholder = [ ...Array(values.length - basis.length).fill(NaN) ];
+            return {
+                basis: placeholder.concat(basis),
+                upper: placeholder.concat(upper),
+                lower: placeholder.concat(lower)
+            };
         }
 
         // --- START OF STRATEGY REPLACEMENT ---
 
-        // 1. Define Strategy Parameters
-        const stochLength = 14;
-        const smoothK = 1;
-        const smoothD = 3;
-        const highEmaLength = 4;
-        const lowEmaLength = 4;
-        const mainEmaLength = 21;
-        const stochOversold = 20;   // <-- New Filter Parameter
-        const stochOverbought = 80; // <-- New Filter Parameter
+        // 1. Define Strategy Parameters from Pine Script
+        const rsiLength = 6;
+        const rsiOverSold = 50;
+        const rsiOverBought = 50;
+        const bbLength = 200;
+        const bbMult = 2.0;
 
         // 2. Calculate Indicators
-        const stochValues = stoch(closes, highs, lows, stochLength);
-        const k = sma(stochValues, smoothK);
-        const d = sma(k, smoothD);
+        const rsiValues = rsi(closes, rsiLength);
+        const { upper: bbUpper, lower: bbLower } = bb(closes, bbLength, bbMult);
 
-        const highEma = ema(highs, highEmaLength);
-        const lowEma = ema(lows, lowEmaLength);
-        const mainEma = ema(closes, mainEmaLength);
-
-        // Ensure we have enough data to calculate all indicators
-        if (d.length === 0 || highEma.length === 0 || lowEma.length === 0 || mainEma.length === 0) {
+        // Ensure we have enough data (at least 2 points) to check for a cross
+        if (rsiValues.length < 2 || bbUpper.length < 2 || closes.length < 2) {
              return res.status(200).json({ success: true, signal: "HOLD", reason: "Not enough data to compute indicators." });
         }
         
-        const currentK = k[k.length - 1];
-        const currentD = d[d.length - 1];
-        const currentHighEma = highEma[highEma.length - 1];
-        const currentLowEma = lowEma[lowEma.length - 1];
-        const currentHl2 = (currentHighEma + currentLowEma) / 2;
-        const currentMainEma = mainEma[mainEma.length - 1];
+        // 3. Get Current and Previous values for crossover/crossunder logic
+        const currentIndex = closes.length - 1;
+        const prevIndex = closes.length - 2;
 
-        // 3. Define Final Buy/Sell Conditions with the Stricter Filter
-        const baseBuyCondition = currentClose < currentLowEma && currentOpen < currentHl2 && currentClose < currentMainEma;
-        const stochBuyFilter = currentK < stochOversold && currentD < stochOversold;
-        const buyCondition = baseBuyCondition && stochBuyFilter;
+        const currentRsi = rsiValues[currentIndex];
+        const prevRsi = rsiValues[prevIndex];
 
-        const baseSellCondition = currentClose > currentHighEma && currentOpen > currentHl2 && currentClose > currentMainEma;
-        const stochSellFilter = currentK > stochOverbought && currentD > stochOverbought;
-        const sellCondition = baseSellCondition && stochSellFilter;
+        const currentPrice = closes[currentIndex];
+        const prevPrice = closes[prevIndex];
 
+        const currentBbUpper = bbUpper[currentIndex];
+        const prevBbUpper = bbUpper[prevIndex];
+        
+        const currentBbLower = bbLower[currentIndex];
+        const prevBbLower = bbLower[prevIndex];
+
+        // 4. Define Final Buy/Sell Conditions (Translating crossover/crossunder)
+        
+        // Crossover: The value was below the threshold on the previous bar and is now at or above it.
+        const rsiCrossover = prevRsi < rsiOverSold && currentRsi >= rsiOverSold;
+        const priceCrossoverBbLower = prevPrice < prevBbLower && currentPrice >= currentBbLower;
+        const buyCondition = rsiCrossover && priceCrossoverBbLower;
+
+        // Crossunder: The value was above the threshold on the previous bar and is now at or below it.
+        const rsiCrossunder = prevRsi > rsiOverBought && currentRsi <= rsiOverBought;
+        const priceCrossunderBbUpper = prevPrice > prevBbUpper && currentPrice <= currentBbUpper;
+        const sellCondition = rsiCrossunder && priceCrossunderBbUpper;
+        
         // --- END OF STRATEGY REPLACEMENT ---
 
         let signal = "HOLD";
